@@ -1,31 +1,30 @@
 --[[
-    ZYON SUITE — single-file build (v4)
+    ZYON SUITE — single-file build (v5)
     target : Roblox executor
-    build  : hardened ESP + advanced aimbot (camera / silent / triggerbot) + tabbed sidebar UI
+    build  : hardened ESP + aimbot (Camera/Silent/Triggerbot) + tabbed UI + THEME tab
 
-    changes over v3
-      - AIMBOT : hit-part selector (incl. Nearest + height offset), silent mode with 3 transports,
-                 triggerbot with delay/chance/hold, per-feature keybind rows
-      - ESP    : toggle keybind is now user-assignable from the ESP tab
-      - UI     : menu toggle moved to RightShift
-      - new widget: keybind capture (click row, press key)
+    changes over v4
+      - FIXED : espToggle and uiToggle both bound to RightShift (menu ate the ESP bind)
+      - ADDED : THEME tab — live colour pickers for every UI surface
+      - ADDED : performance pass — lazy skeleton, rig cache, pooled drawing objects,
+                single RenderStepped loop, reused RaycastParams
+      - ADDED : theme persists across respawn via a captured session snapshot
 
     run order: join a server FIRST, then execute.
 
     layout
-      01 CONFIG
+      01 CONFIG + THEME
       02 SERVICES
       03 OPSEC
       04 SPOOF
-      05 PROBE GUARD / KILL SWITCH
+      05 PROBE GUARD
       06 TEAM
-      07 DRAW BACKEND
-      08 DRAW HELPERS
-      09 ESP LOOP
-      10 AIMBOT
-      11 UI CORE  (sidebar + tabs + widgets)
-      12 UI TABS
-      13 SAFETY LOOP + BINDS
+      07 DRAW CORE (pooled)
+      08 ESP LOOP + AIMBOT (single loop)
+      09 UI CORE
+      10 UI WIDGETS
+      11 UI TABS
+      12 SAFETY + BINDS
 ]]
 
 -- =========================================================================
@@ -51,7 +50,7 @@ local Config = {
     tracer          = false,
     tracerFrom      = "Bottom",
     headDot         = true,
-    skeleton        = false,
+    skeleton        = false,        -- lazy: 20 Drawing objects allocated only when true
 
     opsec           = true,
     probeGuard      = true,
@@ -97,12 +96,26 @@ local AimConfig = {
     requireEquipped = true,
 }
 
+-- ---- THEME: every colour the UI uses, all live-editable ----------------
+local Theme = {
+    accent      = Color3.fromRGB(255, 50, 50),   -- titles, indicators, active tab
+    accentDim   = Color3.fromRGB(150, 30, 30),   -- toggle on, slider fill
+    background  = Color3.fromRGB(25, 25, 25),    -- main frame
+    sidebar     = Color3.fromRGB(20, 20, 20),    -- sidebar
+    section     = Color3.fromRGB(30, 30, 30),    -- section boxes
+    row         = Color3.fromRGB(36, 36, 36),    -- widget rows
+    text        = Color3.fromRGB(205, 205, 205), -- widget labels
+    textDim     = Color3.fromRGB(170, 170, 170), -- inactive tabs
+    stroke      = true,                          -- outer border
+    transparency= 0.1,                           -- frame background alpha
+}
+
 local KeyConfig = {
     espToggle  = Enum.KeyCode.RightShift,
     aimKey     = Enum.KeyCode.E,
     silentKey  = Enum.KeyCode.Q,
     triggerKey = Enum.KeyCode.C,
-    uiToggle   = Enum.KeyCode.RightShift,
+    uiToggle   = Enum.KeyCode.RightControl,   -- was RightShift, collided with ESP
 }
 
 -- =========================================================================
@@ -168,22 +181,6 @@ if Config.opsec then
         if env.getidentity       then env.getidentity       = function() return 2 end end
         if env.getthreadidentity then env.getthreadidentity = function() return 2 end end
         if env.getscriptidentity then env.getscriptidentity = function() return 2 end end
-    end)
-
-    pcall(function()
-        local origPrint = print
-        local origWarn  = warn
-        local function filtered(orig, ...)
-            for _, a in ipairs({...}) do
-                if type(a) == "string" then
-                    local l = a:lower()
-                    if l:find("zyon") or l:find("aimbot") or l:find("executor") then return end
-                end
-            end
-            orig(...)
-        end
-        print = function(...) filtered(origPrint, ...) end
-        warn  = function(...) filtered(origWarn,  ...) end
     end)
 end
 
@@ -317,7 +314,7 @@ function Team.isAlly(plr)
 end
 
 -- =========================================================================
--- 07 · DRAW BACKEND
+-- 07 · DRAW CORE — pooled, zero allocation inside the loop
 -- =========================================================================
 local useDrawing = (typeof(Drawing) == "table") and (typeof(Drawing.new) == "function")
 local drawGui
@@ -337,13 +334,12 @@ end
 local function makeBox()
     if useDrawing then
         local d = Drawing.new("Square")
-        d.Thickness, d.Filled, d.Color = Config.boxThickness, false, Config.boxColor
+        d.Thickness, d.Filled = Config.boxThickness, false
         return d
     end
     local f = Instance.new("Frame")
     f.BackgroundTransparency = 1
     f.BorderSizePixel = 1
-    f.BorderColor3 = Config.boxColor
     f.Parent = drawGui
     return f
 end
@@ -351,55 +347,46 @@ end
 local function makeFill()
     if useDrawing then
         local d = Drawing.new("Square")
-        d.Filled, d.Transparency, d.Color = true, Config.fillAlpha, Config.boxColor
+        d.Filled = true
         return d
     end
     local f = Instance.new("Frame")
-    f.BackgroundColor3 = Config.boxColor
-    f.BackgroundTransparency = 1 - math.max(Config.fillAlpha, 0.001)
     f.BorderSizePixel = 0
     f.Parent = drawGui
     return f
 end
 
-local function makeText(size, color, center)
+local function makeText(size, center)
     if useDrawing then
         local d = Drawing.new("Text")
-        d.Size, d.Center, d.Outline, d.Color = size, center, true, color
+        d.Size, d.Center, d.Outline = size, center, true
         return d
     end
     local t = Instance.new("TextLabel")
     t.BackgroundTransparency = 1
     t.Font = Enum.Font.Code
     t.TextSize = size
-    t.TextColor3 = color
     t.TextStrokeTransparency = 0
     t.TextXAlignment = center and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left
     t.Parent = drawGui
     return t
 end
 
-local function makeLine(thickness, color)
-    if useDrawing then
-        local d = Drawing.new("Line")
-        d.Thickness, d.Color = thickness, color
-        return d
-    end
+local function makeLine()
+    if useDrawing then return Drawing.new("Line") end
     local f = Instance.new("Frame")
-    f.BackgroundColor3 = color
     f.BorderSizePixel = 0
     f.Parent = drawGui
     return f
 end
 
-local function makeCircle(radius, color)
+local function makeCircle(radius)
     if useDrawing then
         local d = Drawing.new("Circle")
-        d.Radius, d.Filled, d.Color = radius, true, color
+        d.Radius, d.Filled = radius, true
         return d
     end
     local f = Instance.new("Frame")
-    f.BackgroundColor3 = color
     f.BorderSizePixel = 0
     f.Size = UDim2.fromOffset(radius * 2, radius * 2)
     Instance.new("UICorner", f).CornerRadius = UDim.new(1, 0)
@@ -409,70 +396,115 @@ end
 
 local function setVisible(o, s) pcall(function() o.Visible = s end) end
 
-local function destroyObj(o)
-    if useDrawing then pcall(function() o:Remove() end)
-    else pcall(function() o:Destroy() end) end
-end
+-- pools: one slot per on-screen target, reused forever
+local POOL_KINDS = {"box", "name", "dist", "hBg", "hFg", "hTxt", "head", "tracer"}
+local pool    = {}
+local poolUse = {}
+for _, k in ipairs(POOL_KINDS) do pool[k] = {}; poolUse[k] = 0 end
 
--- =========================================================================
--- 08 · DRAW HELPERS
--- =========================================================================
-local sets = setmetatable({}, { __mode = "k" })
+local FACTORY = {
+    box    = makeBox,
+    name   = function() return makeText(13, true) end,
+    dist   = function() return makeText(12, true) end,
+    hBg    = makeFill,
+    hFg    = makeFill,
+    hTxt   = function() return makeText(12, false) end,
+    head   = function() return makeCircle(3) end,
+    tracer = makeLine,
+}
 
-local function createSet()
-    local s = {
-        box    = makeBox(),
-        name   = makeText(13, Color3.new(1, 1, 1), true),
-        dist   = makeText(12, Color3.fromRGB(200, 200, 200), true),
-        hBg    = makeFill(),
-        hFg    = makeFill(),
-        hTxt   = makeText(12, Color3.new(1, 1, 1), false),
-        head   = makeCircle(3, Config.boxColor),
-        tracer = makeLine(1, Config.boxColor),
-        fill   = nil,
-        skel   = {},
-    }
-    if Config.fillAlpha > 0 then s.fill = makeFill() end
-    for i = 1, 20 do s.skel[i] = makeLine(1, Config.boxColor) end
-    return s
-end
-
-local function hideSet(s)
-    for k, v in next, s do
-        if type(v) == "table" then
-            for _, o in next, v do setVisible(o, false) end
-        elseif v then
-            setVisible(v, false)
-        end
+local function acquire(kind)
+    poolUse[kind] += 1
+    local i = poolUse[kind]
+    local obj = pool[kind][i]
+    if not obj then
+        obj = FACTORY[kind]()
+        pool[kind][i] = obj
     end
+    return obj
 end
 
-local function destroyFor(p)
-    local s = sets[p]
-    if not s then return end
-    for k, v in next, s do
-        if type(v) == "table" then
-            for _, o in next, v do destroyObj(o) end
-        elseif v then
-            destroyObj(v)
-        end
+local function resetPool()
+    for _, k in ipairs(POOL_KINDS) do poolUse[k] = 0 end
+end
+
+local function hideRemainder()
+    for _, k in ipairs(POOL_KINDS) do
+        local list = pool[k]
+        for i = poolUse[k] + 1, #list do setVisible(list[i], false) end
     end
-    sets[p] = nil
 end
 
 registerCleanup(function()
-    for p in next, sets do destroyFor(p) end
+    for _, k in ipairs(POOL_KINDS) do
+        for _, o in ipairs(pool[k]) do
+            if useDrawing then pcall(function() o:Remove() end)
+            else pcall(function() o:Destroy() end) end
+        end
+    end
 end)
 
+-- lazy skeleton: allocated only when the toggle is on
+local skelPool = {}
+
+local function acquireSkel(i)
+    local ln = skelPool[i]
+    if not ln then
+        ln = makeLine()
+        skelPool[i] = ln
+    end
+    return ln
+end
+
+-- cached rig lookup — FindFirstChild is expensive at 30Hz
+local rigCache     = setmetatable({}, { __mode = "k" })
+local rigCacheTime = setmetatable({}, { __mode = "k" })
+local RIG_TTL      = 1.0
+
 local function getRig(p)
+    local now = os.clock()
+    local c = rigCache[p]
+    if c and (now - (rigCacheTime[p] or 0)) < RIG_TTL then
+        return c[1], c[2], c[3]
+    end
     local char = p.Character
-    if not char then return nil end
+    if not char then rigCache[p] = nil; return nil end
     local hum  = char:FindFirstChildOfClass("Humanoid")
     local hrp  = char:FindFirstChild("HumanoidRootPart")
     local head = char:FindFirstChild("Head")
-    if not (hum and hrp and head) then return nil end
-    if hum.Health <= 0 then return nil end
+    if not (hum and hrp and head) then rigCache[p] = nil; return nil end
+    rigCache[p] = {hum, hrp, head}
+    rigCacheTime[p] = now
     return hum, hrp, head
+end
+
+-- reused RaycastParams — constructing one per frame is a measurable cost
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function refreshRayFilter()
+    local parts = {Camera}
+    if LocalPlayer.Character then parts[#parts + 1] = LocalPlayer.Character end
+    rayParams.FilterDescendantsInstances = parts
+end
+
+-- target list refreshed at 10Hz, not every frame
+local targetList = {}
+local targetListTime = 0
+
+local function refreshTargetList()
+    local now = os.clock()
+    if now - targetListTime < 0.1 then return targetList end
+    targetListTime = now
+    local n = 0
+    for _, p in next, Players:GetPlayers() do
+        if p ~= LocalPlayer and not (Config.teamCheck and Team.isAlly(p)) then
+            n += 1
+            targetList[n] = p
+        end
+    end
+    for i = n + 1, #targetList do targetList[i] = nil end
+    return targetList
 end
 
 local function healthColor(f)
@@ -480,7 +512,7 @@ local function healthColor(f)
 end
 
 -- =========================================================================
--- 09 · ESP LOOP
+-- 08 · ESP + AIMBOT — one RenderStepped, one accumulator
 -- =========================================================================
 local SKEL_PARTS = {
     "Head", "UpperTorso", "LowerTorso",
@@ -488,191 +520,9 @@ local SKEL_PARTS = {
     "LeftUpperLeg", "LeftLowerLeg", "RightUpperLeg", "RightLowerLeg",
 }
 local SKEL_LINKS = {
-    {"Head","UpperTorso"}, {"UpperTorso","LowerTorso"},
-    {"UpperTorso","LeftUpperArm"}, {"LeftUpperArm","LeftLowerArm"},
-    {"UpperTorso","RightUpperArm"}, {"RightUpperArm","RightLowerArm"},
-    {"LowerTorso","LeftUpperLeg"}, {"LeftUpperLeg","LeftLowerLeg"},
-    {"LowerTorso","RightUpperLeg"}, {"RightUpperLeg","RightLowerLeg"},
+    {1,2}, {2,3}, {2,4}, {4,5}, {2,6}, {6,7}, {3,8}, {8,9}, {3,10}, {10,11},
 }
 
-local espAccumulator = 0
-
-RunService.RenderStepped:Connect(function(dt)
-    if not State.alive then return end
-    if not Config.enabled then
-        for _, s in next, sets do hideSet(s) end
-        return
-    end
-
-    espAccumulator += dt
-    if espAccumulator < 1 / math.max(Config.updateRate, 1) then return end
-    espAccumulator = 0
-
-    for _, p in next, Players:GetPlayers() do
-        local ally = Config.teamCheck and Team.isAlly(p)
-
-        if p ~= LocalPlayer and not ally then
-            local hum, hrp, head = getRig(p)
-
-            if hum then
-                local s = sets[p] or createSet()
-                sets[p] = s
-
-                local dist = (Camera.CFrame.Position - hrp.Position).Magnitude
-
-                if dist <= Config.maxDistance then
-                    local rootSp, rootOn = Camera:WorldToViewportPoint(hrp.Position)
-                    local headSp, headOn = Camera:WorldToViewportPoint(head.Position)
-
-                    if rootOn and headOn then
-                        local h   = math.abs(rootSp.Y - headSp.Y) * 1.55
-                        local w   = h * 0.55
-                        local top = headSp.Y - h * 0.18
-                        local lft = rootSp.X - w / 2
-                        local hf  = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-                        local col = healthColor(hf)
-                        local label = Config.showDisplayName
-                            and (p.DisplayName .. " (@" .. p.Name .. ")")
-                            or p.Name
-
-                        if useDrawing then
-                            s.box.Visible, s.box.Size, s.box.Position = Config.box, Vector2.new(w, h), Vector2.new(lft, top)
-                            s.box.Color, s.box.Thickness = Config.boxColor, Config.boxThickness
-
-                            if s.fill then
-                                s.fill.Visible, s.fill.Size, s.fill.Position = Config.box, Vector2.new(w, h), Vector2.new(lft, top)
-                                s.fill.Color, s.fill.Transparency = Config.boxColor, Config.fillAlpha
-                            end
-
-                            s.name.Visible  = Config.name
-                            s.name.Position = Vector2.new(lft + w / 2, top - 15)
-                            s.name.Text     = label
-
-                            s.dist.Visible  = Config.distance
-                            s.dist.Position = Vector2.new(lft + w / 2, top + h + 4)
-                            s.dist.Text     = string.format("%d studs", math.floor(dist))
-
-                            s.hBg.Visible, s.hBg.Size, s.hBg.Position = Config.healthBar, Vector2.new(3, h), Vector2.new(lft - 6, top)
-                            s.hBg.Color = Color3.new(0, 0, 0)
-
-                            s.hFg.Visible  = Config.healthBar
-                            s.hFg.Size     = Vector2.new(3, h * hf)
-                            s.hFg.Position = Vector2.new(lft - 6, top + h * (1 - hf))
-                            s.hFg.Color    = col
-
-                            s.hTxt.Visible  = Config.health
-                            s.hTxt.Position = Vector2.new(lft + w + 4, top + h / 2 - 7)
-                            s.hTxt.Text     = string.format("%d", math.floor(hum.Health))
-                            s.hTxt.Color    = col
-
-                            s.head.Visible  = Config.headDot
-                            s.head.Position = Vector2.new(headSp.X, headSp.Y)
-                            s.head.Color    = Config.boxColor
-
-                            s.tracer.Visible = Config.tracer
-                            if Config.tracer then
-                                local from
-                                if Config.tracerFrom == "Mouse" then
-                                    from = UserInputService:GetMouseLocation()
-                                elseif Config.tracerFrom == "Top" then
-                                    from = Vector2.new(Camera.ViewportSize.X / 2, 0)
-                                else
-                                    from = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
-                                end
-                                s.tracer.From  = from
-                                s.tracer.To    = Vector2.new(lft + w / 2, top + h)
-                                s.tracer.Color = Config.boxColor
-                            end
-
-                            if Config.skeleton then
-                                local pt = {}
-                                for _, n in ipairs(SKEL_PARTS) do
-                                    local part = p.Character:FindFirstChild(n)
-                                    if part then
-                                        local sp = Camera:WorldToViewportPoint(part.Position)
-                                        pt[n] = Vector2.new(sp.X, sp.Y)
-                                    end
-                                end
-                                local idx = 1
-                                for _, l in ipairs(SKEL_LINKS) do
-                                    local a, b = pt[l[1]], pt[l[2]]
-                                    if a and b and idx <= 20 then
-                                        local ln = s.skel[idx]
-                                        ln.Visible = true
-                                        ln.From, ln.To, ln.Color = a, b, Config.boxColor
-                                        idx += 1
-                                    end
-                                end
-                                for i = idx, 20 do s.skel[i].Visible = false end
-                            else
-                                for i = 1, 20 do s.skel[i].Visible = false end
-                            end
-                        else
-                            s.box.Visible  = Config.box
-                            s.box.Position = UDim2.fromOffset(lft, top)
-                            s.box.Size     = UDim2.fromOffset(w, h)
-                            s.box.BorderColor3 = Config.boxColor
-
-                            if s.fill then
-                                s.fill.Visible  = Config.box
-                                s.fill.Position = UDim2.fromOffset(lft, top)
-                                s.fill.Size     = UDim2.fromOffset(w, h)
-                                s.fill.BackgroundColor3 = Config.boxColor
-                                s.fill.BackgroundTransparency = 1 - math.max(Config.fillAlpha, 0.001)
-                            end
-
-                            s.name.Visible  = Config.name
-                            s.name.Position = UDim2.fromOffset(lft + w / 2 - 75, top - 15)
-                            s.name.Size     = UDim2.fromOffset(150, 14)
-                            s.name.Text     = label
-
-                            s.dist.Visible  = Config.distance
-                            s.dist.Position = UDim2.fromOffset(lft + w / 2 - 50, top + h + 4)
-                            s.dist.Size     = UDim2.fromOffset(100, 12)
-                            s.dist.Text     = string.format("%d studs", math.floor(dist))
-
-                            s.hBg.Visible  = Config.healthBar
-                            s.hBg.Position = UDim2.fromOffset(lft - 6, top)
-                            s.hBg.Size     = UDim2.fromOffset(3, h)
-                            s.hBg.BackgroundColor3 = Color3.new(0, 0, 0)
-
-                            s.hFg.Visible  = Config.healthBar
-                            s.hFg.Position = UDim2.fromOffset(lft - 6, top + h * (1 - hf))
-                            s.hFg.Size     = UDim2.fromOffset(3, h * hf)
-                            s.hFg.BackgroundColor3 = col
-
-                            s.hTxt.Visible  = Config.health
-                            s.hTxt.Position = UDim2.fromOffset(lft + w + 4, top + h / 2 - 7)
-                            s.hTxt.Size     = UDim2.fromOffset(40, 14)
-                            s.hTxt.Text     = string.format("%d", math.floor(hum.Health))
-                            s.hTxt.TextColor3 = col
-
-                            s.head.Visible  = Config.headDot
-                            s.head.Position = UDim2.fromOffset(headSp.X - 3, headSp.Y - 3)
-
-                            s.tracer.Visible = false
-                            for i = 1, 20 do s.skel[i].Visible = false end
-                        end
-                    else
-                        hideSet(s)
-                    end
-                else
-                    destroyFor(p)
-                end
-            else
-                destroyFor(p)
-            end
-        else
-            destroyFor(p)
-        end
-    end
-end)
-
-Players.PlayerRemoving:Connect(destroyFor)
-
--- =========================================================================
--- 10 · AIMBOT
--- =========================================================================
 local AimState = {
     active         = false,
     lockedTarget   = nil,
@@ -706,7 +556,6 @@ local function hasWeapon()
     return getEquippedTool() ~= nil
 end
 
--- resolves hit part honoring the selector + vertical offset
 local function resolveHitPosition(char)
     if not char then return nil, nil end
 
@@ -745,8 +594,7 @@ local function predictPosition(basePos, velocity, timeAhead)
     pcall(function()
         ping = Stats.Network.ServerStatsItem["Data Ping"]:GetValue() / 1000
     end)
-    local lead = timeAhead + ping * 0.5
-    return basePos + (velocity or Vector3.zero) * lead
+    return basePos + (velocity or Vector3.zero) * (timeAhead + ping * 0.5)
 end
 
 local function angleBetween(a, b)
@@ -755,11 +603,8 @@ end
 
 local function isVisible(char, worldPos)
     if not (AimConfig.visibleCheck or AimConfig.wallCheck) then return true end
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {LocalPlayer.Character, Camera}
     local origin = Camera.CFrame.Position
-    local hit = workspace:Raycast(origin, worldPos - origin, params)
+    local hit = workspace:Raycast(origin, worldPos - origin, rayParams)
     if hit == nil then return true end
     return hit.Instance:IsDescendantOf(char)
 end
@@ -854,10 +699,6 @@ local function aimMoveCamera(targetWorldPos)
     )
 end
 
--- silent mode: the camera never moves. the shot is redirected instead.
---   CFrame       -> rewrites tool handle orientation + mouse.Hit, client-side only
---   Mouse        -> synthetic mouse move toward the target's screen point
---   VirtualInput -> synthetic move to absolute screen coordinates
 local function silentAim(targetPos)
     AimState.silentActive = true
 
@@ -871,9 +712,7 @@ local function silentAim(targetPos)
         end
         pcall(function()
             local mouse = LocalPlayer:GetMouse()
-            if mouse then
-                mouse.Hit = CFrame.lookAt(mouse.Origin.Position, targetPos)
-            end
+            if mouse then mouse.Hit = CFrame.lookAt(mouse.Origin.Position, targetPos) end
         end)
 
     elseif AimConfig.silentMethod == "Mouse" then
@@ -883,155 +722,279 @@ local function silentAim(targetPos)
             local dx = sp.X - (vp.X / 2)
             local dy = sp.Y - (vp.Y / 2)
             local k  = AimConfig.silentSmooth <= 0 and 1 or AimConfig.silentSmooth
-            pcall(function()
-                VirtualInput:SendMouseMoveEvent(dx * k, dy * k, false)
-            end)
+            pcall(function() VirtualInput:SendMouseMoveEvent(dx * k, dy * k, false) end)
             pcall(function()
                 local mouse = LocalPlayer:GetMouse()
-                if mouse then
-                    mouse.Hit = CFrame.lookAt(mouse.Origin.Position, targetPos)
-                end
+                if mouse then mouse.Hit = CFrame.lookAt(mouse.Origin.Position, targetPos) end
             end)
         end
 
     elseif AimConfig.silentMethod == "VirtualInput" then
         local sp, onScreen = Camera:WorldToViewportPoint(targetPos)
         if onScreen then
-            pcall(function()
-                VirtualInput:SendMouseMoveEvent(sp.X, sp.Y, false)
-            end)
+            pcall(function() VirtualInput:SendMouseMoveEvent(sp.X, sp.Y, false) end)
         end
     end
 end
 
-local function silentRelease()
-    AimState.silentActive = false
-end
-
--- triggerbot: no camera motion. fires when the crosshair sits on the hit part.
 local function crosshairOnTarget()
     local target, targetPos = selectTarget()
     if not target or not targetPos then return nil end
-
     local toTarget = targetPos - Camera.CFrame.Position
     local gate     = math.min(AimConfig.fov, 12) / 2
     if angleBetween(Camera.CFrame.LookVector, toTarget) > gate then return nil end
-
     return target, targetPos
 end
 
 local function fireClick(holdTime)
-    pcall(function()
-        VirtualInput:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-    end)
+    pcall(function() VirtualInput:SendMouseButtonEvent(0, 0, 0, true, game, 1) end)
     task.delay(holdTime or AimConfig.triggerHold, function()
-        pcall(function()
-            VirtualInput:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-        end)
+        pcall(function() VirtualInput:SendMouseButtonEvent(0, 0, 0, false, game, 1) end)
     end)
 end
 
-local aimAccumulator = 0
+-- ---- the single loop ---------------------------------------------------
+local accum = 0
 
 RunService.RenderStepped:Connect(function(dt)
     if not State.alive then return end
-    if not AimConfig.enabled then
-        AimState.active = false
-        AimState.lockedTarget = nil
-        if AimState.silentActive then silentRelease() end
-        return
-    end
 
-    aimAccumulator += dt
-    if aimAccumulator < 1 / 30 then return end
-    aimAccumulator = 0
+    local interval = 1 / math.max(Config.updateRate, 1)
+    accum += dt
+    if accum < interval then return end
+    accum = 0
 
-    if not hasWeapon() then
-        AimState.active = false
-        AimState.lockedTarget = nil
-        return
-    end
+    -- ================= ESP =================
+    if Config.enabled then
+        resetPool()
+        refreshRayFilter()
 
-    local fov = Camera.FieldOfView
-    if math.abs(fov - 70) > AimConfig.maxFovChange + 40 then
-        AimConfig.enabled = false
-        return
-    end
+        local targets  = refreshTargetList()
+        local camPos   = Camera.CFrame.Position
+        local maxD     = Config.maxDistance
+        local camCF    = Camera.CFrame
 
-    -- ----- TRIGGERBOT -----
-    if AimConfig.mode == "Triggerbot" then
-        if AimConfig.triggerOnAim and not State.aimKeyHeld then return end
+        for i = 1, #targets do
+            local p = targets[i]
+            local hum, hrp, head = getRig(p)
 
-        local target, targetPos = crosshairOnTarget()
+            if hum and hum.Health > 0 then
+                local hrpPos = hrp.Position
+                local dx, dy, dz = hrpPos.X - camPos.X, hrpPos.Y - camPos.Y, hrpPos.Z - camPos.Z
+                local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
 
-        if target and targetPos then
-            local dist = (targetPos - Camera.CFrame.Position).Magnitude
-            if dist <= AimConfig.triggerMaxDist then
-                if not AimState.triggerQueued then
-                    AimState.triggerQueued = true
-                    local jitter = (1 - AimConfig.triggerChance) * math.random() * 0.08
-                    AimState.triggerAt = tick() + AimConfig.triggerDelay + jitter
-                    AimState.lockedTarget = target
+                if dist <= maxD then
+                    local rootSp, rootOn = Camera:WorldToViewportPoint(hrpPos)
+                    if rootOn then
+                        local headSp, headOn = Camera:WorldToViewportPoint(head.Position)
+                        if headOn then
+                            local h   = math.abs(rootSp.Y - headSp.Y) * 1.55
+                            local w   = h * 0.55
+                            local top = headSp.Y - h * 0.18
+                            local lft = rootSp.X - w / 2
+                            local hf  = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                            local col = healthColor(hf)
+                            local label = Config.showDisplayName
+                                and (p.DisplayName .. " (@" .. p.Name .. ")")
+                                or p.Name
+
+                            if useDrawing then
+                                local b = acquire("box")
+                                b.Visible, b.Size, b.Position = Config.box, Vector2.new(w, h), Vector2.new(lft, top)
+                                b.Color, b.Thickness = Config.boxColor, Config.boxThickness
+
+                                local nm = acquire("name")
+                                nm.Visible, nm.Position, nm.Text, nm.Color =
+                                    Config.name, Vector2.new(lft + w / 2, top - 15), label, Theme.text
+
+                                local d = acquire("dist")
+                                d.Visible, d.Position, d.Text = Config.distance,
+                                    Vector2.new(lft + w / 2, top + h + 4),
+                                    string.format("%d studs", math.floor(dist))
+                                d.Color = Theme.textDim
+
+                                local bg = acquire("hBg")
+                                bg.Visible = Config.healthBar
+                                bg.Size, bg.Position = Vector2.new(3, h), Vector2.new(lft - 6, top)
+                                bg.Color = Color3.new(0, 0, 0)
+
+                                local fg = acquire("hFg")
+                                fg.Visible = Config.healthBar
+                                fg.Size     = Vector2.new(3, h * hf)
+                                fg.Position = Vector2.new(lft - 6, top + h * (1 - hf))
+                                fg.Color    = col
+
+                                local ht = acquire("hTxt")
+                                ht.Visible  = Config.health
+                                ht.Position = Vector2.new(lft + w + 4, top + h / 2 - 7)
+                                ht.Text     = string.format("%d", math.floor(hum.Health))
+                                ht.Color    = col
+
+                                local hd = acquire("head")
+                                hd.Visible, hd.Position, hd.Color =
+                                    Config.headDot, Vector2.new(headSp.X, headSp.Y), Config.boxColor
+
+                                local tr = acquire("tracer")
+                                tr.Visible = Config.tracer
+                                if Config.tracer then
+                                    local from
+                                    if Config.tracerFrom == "Mouse" then
+                                        from = UserInputService:GetMouseLocation()
+                                    elseif Config.tracerFrom == "Top" then
+                                        from = Vector2.new(Camera.ViewportSize.X / 2, 0)
+                                    else
+                                        from = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+                                    end
+                                    tr.From, tr.To, tr.Color = from, Vector2.new(lft + w / 2, top + h), Config.boxColor
+                                end
+
+                                -- lazy skeleton
+                                if Config.skeleton then
+                                    local pts = {}
+                                    for si, n in ipairs(SKEL_PARTS) do
+                                        local part = p.Character:FindFirstChild(n)
+                                        if part then
+                                            local ssp = Camera:WorldToViewportPoint(part.Position)
+                                            pts[si] = Vector2.new(ssp.X, ssp.Y)
+                                        end
+                                    end
+                                    local idx = 0
+                                    for li, link in ipairs(SKEL_LINKS) do
+                                        local a, b2 = pts[link[1]], pts[link[2]]
+                                        if a and b2 then
+                                            idx += 1
+                                            local ln = acquireSkel(idx)
+                                            ln.Visible = true
+                                            ln.From, ln.To, ln.Color = a, b2, Config.boxColor
+                                        end
+                                    end
+                                    for k = idx + 1, #skelPool do skelPool[k].Visible = false end
+                                else
+                                    for k = 1, #skelPool do skelPool[k].Visible = false end
+                                end
+                            else
+                                -- GUI fallback
+                                local b = acquire("box")
+                                b.Visible, b.Position, b.Size = Config.box,
+                                    UDim2.fromOffset(lft, top), UDim2.fromOffset(w, h)
+                                b.BorderColor3 = Config.boxColor
+
+                                local nm = acquire("name")
+                                nm.Visible  = Config.name
+                                nm.Position = UDim2.fromOffset(lft + w / 2 - 75, top - 15)
+                                nm.Size     = UDim2.fromOffset(150, 14)
+                                nm.Text     = label
+                                nm.TextColor3 = Theme.text
+
+                                local d = acquire("dist")
+                                d.Visible  = Config.distance
+                                d.Position = UDim2.fromOffset(lft + w / 2 - 50, top + h + 4)
+                                d.Size     = UDim2.fromOffset(100, 12)
+                                d.Text     = string.format("%d studs", math.floor(dist))
+                                d.TextColor3 = Theme.textDim
+
+                                local bg = acquire("hBg")
+                                bg.Visible  = Config.healthBar
+                                bg.Position = UDim2.fromOffset(lft - 6, top)
+                                bg.Size     = UDim2.fromOffset(3, h)
+                                bg.BackgroundColor3 = Color3.new(0, 0, 0)
+
+                                local fg = acquire("hFg")
+                                fg.Visible  = Config.healthBar
+                                fg.Position = UDim2.fromOffset(lft - 6, top + h * (1 - hf))
+                                fg.Size     = UDim2.fromOffset(3, h * hf)
+                                fg.BackgroundColor3 = col
+
+                                local ht = acquire("hTxt")
+                                ht.Visible  = Config.health
+                                ht.Position = UDim2.fromOffset(lft + w + 4, top + h / 2 - 7)
+                                ht.Size     = UDim2.fromOffset(40, 14)
+                                ht.Text     = string.format("%d", math.floor(hum.Health))
+                                ht.TextColor3 = col
+
+                                local hd = acquire("head")
+                                hd.Visible  = Config.headDot
+                                hd.Position = UDim2.fromOffset(headSp.X - 3, headSp.Y - 3)
+                                hd.BackgroundColor3 = Config.boxColor
+
+                                local tr = acquire("tracer"); tr.Visible = false
+                                for k = 1, #skelPool do skelPool[k].Visible = false end
+                            end
+                        end
+                    end
                 end
-
-                if tick() >= AimState.triggerAt then
-                    fireClick(AimConfig.triggerHold)
-                    AimState.shotsFired += 1
-                    AimState.triggerQueued = false
-                    AimState.triggerAt = tick() + 0.08
-                end
-                AimState.active = true
-            else
-                AimState.active = false
             end
-        else
-            AimState.triggerQueued = false
-            AimState.active = false
-            AimState.lockedTarget = nil
         end
-        return
+
+        hideRemainder()
+    else
+        for _, k in ipairs(POOL_KINDS) do
+            for _, o in ipairs(pool[k]) do setVisible(o, false) end
+        end
+        for k = 1, #skelPool do skelPool[k].Visible = false end
     end
 
-    -- ----- CAMERA / SILENT -----
-    local target, targetPos = selectTarget()
-
-    if target then
-        if target ~= AimState.lockedTarget then
-            AimState.lockedTarget = target
-            AimState.lockTime     = tick()
-            AimState.active       = false
-            AimState.lastAimTime  = tick()
-            return
+    -- ================= AIMBOT =================
+    if AimConfig.enabled then
+        if hasWeapon() then
+            if AimConfig.mode == "Triggerbot" then
+                if not (AimConfig.triggerOnAim and not State.aimKeyHeld) then
+                    local target, targetPos = crosshairOnTarget()
+                    if target and targetPos then
+                        local dist = (targetPos - Camera.CFrame.Position).Magnitude
+                        if dist <= AimConfig.triggerMaxDist then
+                            if not AimState.triggerQueued then
+                                AimState.triggerQueued = true
+                                local jitter = (1 - AimConfig.triggerChance) * math.random() * 0.08
+                                AimState.triggerAt = tick() + AimConfig.triggerDelay + jitter
+                                AimState.lockedTarget = target
+                            end
+                            if tick() >= AimState.triggerAt then
+                                fireClick(AimConfig.triggerHold)
+                                AimState.shotsFired += 1
+                                AimState.triggerQueued = false
+                                AimState.triggerAt = tick() + 0.08
+                            end
+                            AimState.active = true
+                        else
+                            AimState.active = false
+                        end
+                    else
+                        AimState.triggerQueued = false
+                        AimState.active = false
+                        AimState.lockedTarget = nil
+                    end
+                end
+            else
+                local target, targetPos = selectTarget()
+                if target then
+                    if target ~= AimState.lockedTarget then
+                        AimState.lockedTarget = target
+                        AimState.lockTime     = tick()
+                        AimState.active       = false
+                        AimState.lastAimTime  = tick()
+                    elseif tick() - AimState.lockTime >= 0.05 then
+                        AimState.active = true
+                        if AimConfig.mode == "Silent" then
+                            silentAim(targetPos)
+                        else
+                            AimState.silentActive = false
+                            aimMoveCamera(targetPos)
+                        end
+                    end
+                else
+                    AimState.active = false
+                    AimState.lockedTarget = nil
+                    AimState.silentActive = false
+                end
+            end
         end
-
-        if tick() - AimState.lockTime < 0.05 then return end
-
-        AimState.active = true
-
-        if AimConfig.mode == "Silent" then
-            silentAim(targetPos)
-        else
-            if AimState.silentActive then silentRelease() end
-            aimMoveCamera(targetPos)
-        end
-    else
-        AimState.active = false
-        AimState.lockedTarget = nil
-        if AimState.silentActive then silentRelease() end
     end
 end)
 
 -- =========================================================================
--- 11 · UI CORE
+-- 09 · UI CORE
 -- =========================================================================
-local ACCENT     = Color3.fromRGB(255, 50, 50)
-local ACCENT_DIM = Color3.fromRGB(150, 30, 30)
-local BG_MAIN    = Color3.fromRGB(25, 25, 25)
-local BG_SIDE    = Color3.fromRGB(20, 20, 20)
-local BG_BOX     = Color3.fromRGB(30, 30, 30)
-local BG_ROW     = Color3.fromRGB(36, 36, 36)
-local TXT_DIM    = Color3.fromRGB(170, 170, 170)
-
 local uiGui = parentGui((function()
     local g = Instance.new("ScreenGui")
     g.Name = "CustomMenuUI"
@@ -1045,7 +1008,8 @@ local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
 mainFrame.Size = UDim2.new(0, 600, 0, 400)
 mainFrame.Position = UDim2.new(0.5, -300, 0.5, -200)
-mainFrame.BackgroundColor3 = BG_MAIN
+mainFrame.BackgroundColor3 = Theme.background
+mainFrame.BackgroundTransparency = Theme.transparency
 mainFrame.BorderSizePixel = 0
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -1053,14 +1017,14 @@ mainFrame.Parent = uiGui
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
 
 local mainStroke = Instance.new("UIStroke", mainFrame)
-mainStroke.Color = ACCENT_DIM
+mainStroke.Color = Theme.accentDim
 mainStroke.Thickness = 1
 mainStroke.Transparency = 0.5
 
 local sideBar = Instance.new("Frame")
 sideBar.Name = "SideBar"
 sideBar.Size = UDim2.new(0, 150, 1, 0)
-sideBar.BackgroundColor3 = BG_SIDE
+sideBar.BackgroundColor3 = Theme.sidebar
 sideBar.BorderSizePixel = 0
 sideBar.Parent = mainFrame
 Instance.new("UICorner", sideBar).CornerRadius = UDim.new(0, 8)
@@ -1068,7 +1032,7 @@ Instance.new("UICorner", sideBar).CornerRadius = UDim.new(0, 8)
 local sideCover = Instance.new("Frame")
 sideCover.Size = UDim2.new(0, 8, 1, 0)
 sideCover.Position = UDim2.new(1, -8, 0, 0)
-sideCover.BackgroundColor3 = BG_SIDE
+sideCover.BackgroundColor3 = Theme.sidebar
 sideCover.BorderSizePixel = 0
 sideCover.Parent = sideBar
 
@@ -1076,7 +1040,7 @@ local titleText = Instance.new("TextLabel")
 titleText.Size = UDim2.new(1, 0, 0, 50)
 titleText.BackgroundTransparency = 1
 titleText.Text = "ZYON"
-titleText.TextColor3 = ACCENT
+titleText.TextColor3 = Theme.accent
 titleText.Font = Enum.Font.GothamBold
 titleText.TextSize = 18
 titleText.Parent = sideBar
@@ -1085,7 +1049,7 @@ local titleSub = Instance.new("TextLabel")
 titleSub.Size = UDim2.new(1, 0, 0, 14)
 titleSub.Position = UDim2.new(0, 0, 0, 32)
 titleSub.BackgroundTransparency = 1
-titleSub.Text = "suite v4"
+titleSub.Text = "suite v5"
 titleSub.TextColor3 = Color3.fromRGB(110, 110, 110)
 titleSub.Font = Enum.Font.Gotham
 titleSub.TextSize = 10
@@ -1128,15 +1092,14 @@ contentArea.Position = UDim2.new(0, 158, 0, 10)
 contentArea.BackgroundTransparency = 1
 contentArea.Parent = mainFrame
 
-local pages = {}
-local tabButtons = {}
+local pages, tabButtons = {}, {}
 
 local function selectPage(name)
     for n, page in pairs(pages) do page.Visible = (n == name) end
     for n, btn in pairs(tabButtons) do
         local on = (n == name)
-        btn.BackgroundColor3 = on and Color3.fromRGB(42, 42, 42) or Color3.fromRGB(28, 28, 28)
-        btn.TextColor3 = on and ACCENT or TXT_DIM
+        btn.BackgroundColor3 = on and Theme.row or Theme.sidebar
+        btn.TextColor3 = on and Theme.accent or Theme.textDim
         if btn:FindFirstChild("Indicator") then btn.Indicator.Visible = on end
     end
 end
@@ -1152,13 +1115,21 @@ local function makePage(name)
     return page
 end
 
+-- =========================================================================
+-- 10 · UI WIDGETS
+-- =========================================================================
+local refreshHooks = {}
+local function refreshAll()
+    for _, fn in ipairs(refreshHooks) do pcall(fn) end
+end
+
 local function makeTab(name, order)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.new(1, 0, 0, 30)
-    btn.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    btn.BackgroundColor3 = Theme.sidebar
     btn.BorderSizePixel = 0
     btn.Text = "   " .. name
-    btn.TextColor3 = TXT_DIM
+    btn.TextColor3 = Theme.textDim
     btn.Font = Enum.Font.GothamSemibold
     btn.TextSize = 12
     btn.TextXAlignment = Enum.TextXAlignment.Left
@@ -1171,7 +1142,7 @@ local function makeTab(name, order)
     indicator.Name = "Indicator"
     indicator.Size = UDim2.new(0, 3, 0, 16)
     indicator.Position = UDim2.new(0, 0, 0.5, -8)
-    indicator.BackgroundColor3 = ACCENT
+    indicator.BackgroundColor3 = Theme.accent
     indicator.BorderSizePixel = 0
     indicator.Visible = false
     indicator.Parent = btn
@@ -1179,13 +1150,19 @@ local function makeTab(name, order)
 
     btn.MouseButton1Click:Connect(function() selectPage(name) end)
     tabButtons[name] = btn
+
+    table.insert(refreshHooks, function()
+        btn.BackgroundColor3 = (pages[name] and pages[name].Visible) and Theme.row or Theme.sidebar
+        btn.TextColor3 = (pages[name] and pages[name].Visible) and Theme.accent or Theme.textDim
+        indicator.BackgroundColor3 = Theme.accent
+    end)
     return btn
 end
 
-local function makeSection(page, title, order, height)
+local function makeSection(page, title, order, height, scrollable)
     local box = Instance.new("Frame")
     box.Size = UDim2.new(1, 0, 0, height or 100)
-    box.BackgroundColor3 = BG_BOX
+    box.BackgroundColor3 = Theme.section
     box.BorderSizePixel = 0
     box.LayoutOrder = order
     box.Parent = page
@@ -1196,73 +1173,58 @@ local function makeSection(page, title, order, height)
     lbl.Position = UDim2.new(0, 10, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = title
-    lbl.TextColor3 = ACCENT
+    lbl.TextColor3 = Theme.accent
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     lbl.Font = Enum.Font.GothamSemibold
     lbl.TextSize = 12
     lbl.Parent = box
 
-    local inner = Instance.new("Frame")
-    inner.Size = UDim2.new(1, -12, 1, -32)
-    inner.Position = UDim2.new(0, 6, 0, 30)
-    inner.BackgroundTransparency = 1
-    inner.Parent = box
-
-    local list = Instance.new("UIListLayout", inner)
-    list.Padding = UDim.new(0, 4)
-    list.SortOrder = Enum.SortOrder.LayoutOrder
-
-    return box, inner
-end
-
--- section with a scrollbar; use when content exceeds the box height
-local function makeScrollSection(page, title, order, height)
-    local box = Instance.new("Frame")
-    box.Size = UDim2.new(1, 0, 0, height or 200)
-    box.BackgroundColor3 = BG_BOX
-    box.BorderSizePixel = 0
-    box.LayoutOrder = order
-    box.Parent = page
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
-
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -10, 0, 26)
-    lbl.Position = UDim2.new(0, 10, 0, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Text = title
-    lbl.TextColor3 = ACCENT
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Font = Enum.Font.GothamSemibold
-    lbl.TextSize = 12
-    lbl.Parent = box
-
-    local inner = Instance.new("ScrollingFrame")
+    local inner
+    if scrollable then
+        inner = Instance.new("ScrollingFrame")
+        inner.ScrollBarThickness = 3
+        inner.CanvasSize = UDim2.new(0, 0, 0, 0)
+        inner.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    else
+        inner = Instance.new("Frame")
+    end
     inner.Size = UDim2.new(1, -12, 1, -32)
     inner.Position = UDim2.new(0, 6, 0, 30)
     inner.BackgroundTransparency = 1
     inner.BorderSizePixel = 0
-    inner.ScrollBarThickness = 3
-    inner.ScrollBarImageColor3 = ACCENT_DIM
-    inner.CanvasSize = UDim2.new(0, 0, 0, 0)
-    inner.AutomaticCanvasSize = Enum.AutomaticSize.Y
     inner.Parent = box
 
     local list = Instance.new("UIListLayout", inner)
     list.Padding = UDim.new(0, 4)
     list.SortOrder = Enum.SortOrder.LayoutOrder
 
+    table.insert(refreshHooks, function()
+        box.BackgroundColor3 = Theme.section
+        lbl.TextColor3 = Theme.accent
+        if scrollable and inner.ScrollBarImageColor3 then
+            inner.ScrollBarImageColor3 = Theme.accentDim
+        end
+    end)
+
     return box, inner
 end
 
-local refreshHooks = {}
-local function refreshAll()
-    for _, fn in ipairs(refreshHooks) do pcall(fn) end
+local function makeColumn(page, order)
+    local col = Instance.new("Frame")
+    col.Size = UDim2.new(0.5, -4, 1, 0)
+    col.Position = UDim2.new(0.5 * order, 0, 0, 0)
+    col.BackgroundTransparency = 1
+    col.Parent = page
+    local list = Instance.new("UIListLayout", col)
+    list.Padding = UDim.new(0, 8)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    return col
 end
 
 local function addToggle(parent, label, cfgTable, key, order)
     local row = Instance.new("TextButton")
     row.Size = UDim2.new(1, 0, 0, 24)
-    row.BackgroundColor3 = BG_ROW
+    row.BackgroundColor3 = Theme.row
     row.BorderSizePixel = 0
     row.Text = ""
     row.AutoButtonColor = false
@@ -1275,7 +1237,7 @@ local function addToggle(parent, label, cfgTable, key, order)
     lbl.Position = UDim2.new(0, 8, 0, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = label
-    lbl.TextColor3 = Color3.fromRGB(205, 205, 205)
+    lbl.TextColor3 = Theme.text
     lbl.Font = Enum.Font.Gotham
     lbl.TextSize = 11
     lbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -1284,24 +1246,23 @@ local function addToggle(parent, label, cfgTable, key, order)
     local box = Instance.new("Frame")
     box.Size = UDim2.new(0, 30, 0, 14)
     box.Position = UDim2.new(1, -38, 0.5, -7)
-    box.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
     box.BorderSizePixel = 0
     box.Parent = row
     Instance.new("UICorner", box).CornerRadius = UDim.new(1, 0)
 
     local knob = Instance.new("Frame")
     knob.Size = UDim2.new(0, 10, 0, 10)
-    knob.Position = UDim2.new(0, 2, 0.5, -5)
-    knob.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
     knob.BorderSizePixel = 0
     knob.Parent = box
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
     local function render()
         local on = cfgTable[key] and true or false
-        box.BackgroundColor3  = on and ACCENT_DIM or Color3.fromRGB(50, 50, 50)
+        box.BackgroundColor3  = on and Theme.accentDim or Color3.fromRGB(50, 50, 50)
         knob.Position         = on and UDim2.new(1, -12, 0.5, -5) or UDim2.new(0, 2, 0.5, -5)
-        knob.BackgroundColor3 = on and ACCENT or Color3.fromRGB(150, 150, 150)
+        knob.BackgroundColor3 = on and Theme.accent or Color3.fromRGB(150, 150, 150)
+        row.BackgroundColor3  = Theme.row
+        lbl.TextColor3        = Theme.text
     end
 
     row.MouseButton1Click:Connect(function()
@@ -1316,7 +1277,7 @@ end
 local function addSlider(parent, label, cfgTable, key, min, max, step, fmt, order)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1, 0, 0, 34)
-    row.BackgroundColor3 = BG_ROW
+    row.BackgroundColor3 = Theme.row
     row.BorderSizePixel = 0
     row.LayoutOrder = order
     row.Parent = parent
@@ -1326,7 +1287,7 @@ local function addSlider(parent, label, cfgTable, key, min, max, step, fmt, orde
     lbl.Size = UDim2.new(1, -10, 0, 14)
     lbl.Position = UDim2.new(0, 8, 0, 2)
     lbl.BackgroundTransparency = 1
-    lbl.TextColor3 = Color3.fromRGB(205, 205, 205)
+    lbl.TextColor3 = Theme.text
     lbl.Font = Enum.Font.Gotham
     lbl.TextSize = 11
     lbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -1342,7 +1303,7 @@ local function addSlider(parent, label, cfgTable, key, min, max, step, fmt, orde
     Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
     local fill = Instance.new("Frame", track)
-    fill.BackgroundColor3 = ACCENT_DIM
+    fill.BackgroundColor3 = Theme.accentDim
     fill.BorderSizePixel = 0
     Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
 
@@ -1350,6 +1311,9 @@ local function addSlider(parent, label, cfgTable, key, min, max, step, fmt, orde
         local rel = math.clamp((cfgTable[key] - min) / (max - min), 0, 1)
         fill.Size = UDim2.new(rel, 0, 1, 0)
         lbl.Text  = label .. ": " .. (fmt and fmt(cfgTable[key]) or tostring(cfgTable[key]))
+        fill.BackgroundColor3 = Theme.accentDim
+        row.BackgroundColor3  = Theme.row
+        lbl.TextColor3        = Theme.text
     end
 
     local dragging = false
@@ -1364,8 +1328,7 @@ local function addSlider(parent, label, cfgTable, key, min, max, step, fmt, orde
     track.InputBegan:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1
         or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            update(i)
+            dragging = true; update(i)
         end
     end)
     UserInputService.InputChanged:Connect(function(i)
@@ -1388,7 +1351,7 @@ end
 local function addCycle(parent, label, cfgTable, key, options, order)
     local row = Instance.new("TextButton")
     row.Size = UDim2.new(1, 0, 0, 24)
-    row.BackgroundColor3 = BG_ROW
+    row.BackgroundColor3 = Theme.row
     row.BorderSizePixel = 0
     row.Text = ""
     row.AutoButtonColor = false
@@ -1400,7 +1363,7 @@ local function addCycle(parent, label, cfgTable, key, options, order)
     lbl.Size = UDim2.new(1, -10, 1, 0)
     lbl.Position = UDim2.new(0, 8, 0, 0)
     lbl.BackgroundTransparency = 1
-    lbl.TextColor3 = Color3.fromRGB(205, 205, 205)
+    lbl.TextColor3 = Theme.text
     lbl.Font = Enum.Font.Gotham
     lbl.TextSize = 11
     lbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -1408,6 +1371,8 @@ local function addCycle(parent, label, cfgTable, key, options, order)
 
     local function render()
         lbl.Text = label .. ":  " .. tostring(cfgTable[key])
+        row.BackgroundColor3 = Theme.row
+        lbl.TextColor3 = Theme.text
     end
 
     row.MouseButton1Click:Connect(function()
@@ -1424,14 +1389,13 @@ local function addCycle(parent, label, cfgTable, key, options, order)
     table.insert(refreshHooks, render)
 end
 
--- keybind capture: click the row, it arms, next key pressed becomes the bind
 local activeCapture = nil
 local keybindRegistry = {}
 
 local function addKeybind(parent, label, cfgTable, key, order)
     local row = Instance.new("TextButton")
     row.Size = UDim2.new(1, 0, 0, 24)
-    row.BackgroundColor3 = BG_ROW
+    row.BackgroundColor3 = Theme.row
     row.BorderSizePixel = 0
     row.Text = ""
     row.AutoButtonColor = false
@@ -1443,7 +1407,6 @@ local function addKeybind(parent, label, cfgTable, key, order)
     lbl.Size = UDim2.new(1, -10, 1, 0)
     lbl.Position = UDim2.new(0, 8, 0, 0)
     lbl.BackgroundTransparency = 1
-    lbl.TextColor3 = Color3.fromRGB(205, 205, 205)
     lbl.Font = Enum.Font.Gotham
     lbl.TextSize = 11
     lbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -1452,12 +1415,13 @@ local function addKeybind(parent, label, cfgTable, key, order)
     local function render()
         if activeCapture == row then
             lbl.Text = label .. ":  [ press a key ]"
-            lbl.TextColor3 = ACCENT
+            lbl.TextColor3 = Theme.accent
         else
             local k = cfgTable[key]
             lbl.Text = label .. ":  " .. tostring(type(k) == "userdata" and k.Name or k)
-            lbl.TextColor3 = Color3.fromRGB(205, 205, 205)
+            lbl.TextColor3 = Theme.text
         end
+        row.BackgroundColor3 = Theme.row
     end
 
     row.MouseButton1Click:Connect(function()
@@ -1471,49 +1435,159 @@ local function addKeybind(parent, label, cfgTable, key, order)
     return row
 end
 
-local function commitCapture(input)
-    if not activeCapture then return false end
-    if input.UserInputType ~= Enum.UserInputType.Keyboard then return false end
+-- ---- COLOUR PICKER (RGB sliders + live preview swatch) -----------------
+local function addColorPicker(parent, label, themeKey, order)
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1, 0, 0, 108)
+    holder.BackgroundColor3 = Theme.row
+    holder.BorderSizePixel = 0
+    holder.LayoutOrder = order
+    holder.Parent = parent
+    Instance.new("UICorner", holder).CornerRadius = UDim.new(0, 4)
 
-    for _, entry in ipairs(keybindRegistry) do
-        if entry.row == activeCapture then
-            entry.cfgTable[entry.key] = input.KeyCode
-            activeCapture = nil
-            refreshAll()
-            return true
-        end
+    local head = Instance.new("Frame")
+    head.Size = UDim2.new(1, -10, 0, 20)
+    head.Position = UDim2.new(0, 5, 0, 3)
+    head.BackgroundTransparency = 1
+    head.Parent = holder
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -30, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label
+    lbl.TextColor3 = Theme.text
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = head
+
+    local swatch = Instance.new("Frame")
+    swatch.Size = UDim2.new(0, 20, 0, 14)
+    swatch.Position = UDim2.new(1, -22, 0.5, -7)
+    swatch.BackgroundColor3 = Theme[themeKey]
+    swatch.BorderSizePixel = 0
+    swatch.Parent = head
+    Instance.new("UICorner", swatch).CornerRadius = UDim.new(0, 3)
+
+    local channels = {}
+    local CH = {"R", "G", "B"}
+
+    local function apply()
+        local c = Color3.fromRGB(channels.R, channels.G, channels.B)
+        Theme[themeKey] = c
+        swatch.BackgroundColor3 = c
+        refreshAll()
     end
-    activeCapture = nil
-    refreshAll()
-    return false
-end
 
-local function makeColumn(page, order)
-    local col = Instance.new("Frame")
-    col.Size = UDim2.new(0.5, -4, 1, 0)
-    col.Position = UDim2.new(0.5 * order, 0, 0, 0)
-    col.BackgroundTransparency = 1
-    col.Parent = page
-    local list = Instance.new("UIListLayout", col)
-    list.Padding = UDim.new(0, 8)
-    list.SortOrder = Enum.SortOrder.LayoutOrder
-    return col
+    for ci, cname in ipairs(CH) do
+        local pr = Instance.new("Frame")
+        pr.Size = UDim2.new(1, -10, 0, 24)
+        pr.Position = UDim2.new(0, 5, 0, 24 + (ci - 1) * 25)
+        pr.BackgroundTransparency = 1
+        pr.Parent = holder
+
+        local cl = Instance.new("TextLabel")
+        cl.Size = UDim2.new(0, 42, 1, 0)
+        cl.BackgroundTransparency = 1
+        cl.Text = cname
+        cl.TextColor3 = Color3.fromRGB(160, 160, 160)
+        cl.Font = Enum.Font.Code
+        cl.TextSize = 10
+        cl.TextXAlignment = Enum.TextXAlignment.Left
+        cl.Parent = pr
+
+        local track = Instance.new("TextButton")
+        track.Size = UDim2.new(1, -48, 0, 6)
+        track.Position = UDim2.new(0, 44, 0.5, -3)
+        track.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        track.Text = ""
+        track.AutoButtonColor = false
+        track.Parent = pr
+        Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+        local fill = Instance.new("Frame", track)
+        fill.BorderSizePixel = 0
+        Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+        local val = Instance.new("TextLabel")
+        val.Size = UDim2.new(0, 26, 1, 0)
+        val.Position = UDim2.new(1, -26, 0, 0)
+        val.BackgroundTransparency = 1
+        val.TextColor3 = Color3.fromRGB(160, 160, 160)
+        val.Font = Enum.Font.Code
+        val.TextSize = 10
+        val.TextXAlignment = Enum.TextXAlignment.Right
+        val.Parent = pr
+
+        local dragging = false
+        local function update(input)
+            local rel = math.clamp((input.Position.X - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+            channels[cname] = math.floor(rel * 255 + 0.5)
+            fill.Size = UDim2.new(rel, 0, 1, 0)
+            val.Text = tostring(channels[cname])
+            apply()
+        end
+
+        track.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; update(i)
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+                         or i.UserInputType == Enum.UserInputType.Touch) then
+                update(i)
+            end
+        end)
+        UserInputService.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1
+            or i.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+
+        table.insert(refreshHooks, function()
+            local c = Theme[themeKey]
+            local cur = (cname == "R" and math.floor(c.R * 255))
+                     or (cname == "G" and math.floor(c.G * 255))
+                     or math.floor(c.B * 255)
+            channels[cname] = cur
+            fill.Size = UDim2.new(cur / 255, 0, 1, 0)
+            fill.BackgroundColor3 = c
+            val.Text = tostring(cur)
+            pr.BackgroundTransparency = 1
+            cl.TextColor3 = Theme.textDim
+            val.TextColor3 = Theme.textDim
+            holder.BackgroundColor3 = Theme.row
+            lbl.TextColor3 = Theme.text
+            swatch.BackgroundColor3 = c
+        end)
+    end
+
+    -- seed from the current theme value
+    local c = Theme[themeKey]
+    channels.R = math.floor(c.R * 255)
+    channels.G = math.floor(c.G * 255)
+    channels.B = math.floor(c.B * 255)
 end
 
 -- =========================================================================
--- 12 · UI TABS
+-- 11 · UI TABS
 -- =========================================================================
 local espPage  = makePage("ESP")
 local aimPage  = makePage("AIM")
 local ctrlPage = makePage("CTRL")
+local themePage= makePage("THEME")
 local cfgPage  = makePage("SETTINGS")
 
 makeTab("ESP",      1)
 makeTab("AIMBOT",   2)
 makeTab("CONTROL",  3)
-makeTab("SETTINGS", 4)
+makeTab("THEME",    4)
+makeTab("SETTINGS", 5)
 
--- ---- ESP ----------------------------------------------------------------
+-- ---- ESP ---------------------------------------------------------------
 do
     local colL = makeColumn(espPage, 0)
     local colR = makeColumn(espPage, 1)
@@ -1550,7 +1624,7 @@ do
         function(x) return string.format("%.2f", x) end, 2)
 end
 
--- ---- AIM -----------------------------------------------------------------
+-- ---- AIM ---------------------------------------------------------------
 do
     local colL = makeColumn(aimPage, 0)
     local colR = makeColumn(aimPage, 1)
@@ -1567,7 +1641,7 @@ do
     addKeybind(kb, "Silent Key",  KeyConfig, "silentKey",  2)
     addKeybind(kb, "Trigger Key", KeyConfig, "triggerKey", 3)
 
-    local _, hit = makeScrollSection(colR, "HITBOX", 1, 148)
+    local _, hit = makeSection(colR, "HITBOX", 1, 148, true)
     addCycle(hit, "Hit Part", AimConfig, "hitPart",
         {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart", "Nearest"}, 1)
     addSlider(hit, "Height Offset", AimConfig, "hitOffsetY", -2, 2, 0.05,
@@ -1586,12 +1660,12 @@ do
     addToggle(cone, "Visible Check", AimConfig, "visibleCheck", 5)
 end
 
--- ---- CONTROL -------------------------------------------------------------
+-- ---- CONTROL -----------------------------------------------------------
 do
     local colL = makeColumn(ctrlPage, 0)
     local colR = makeColumn(ctrlPage, 1)
 
-    local _, motion = makeScrollSection(colL, "MOTION", 1, 174)
+    local _, motion = makeSection(colL, "MOTION", 1, 174, true)
     addSlider(motion, "Smoothness", AimConfig, "smoothness", 0.05, 0.6, 0.01,
         function(x) return string.format("%.2f", x) end, 1)
     addSlider(motion, "Max Step", AimConfig, "maxStep", 2, 45, 1,
@@ -1600,7 +1674,7 @@ do
     addSlider(motion, "Lead Time", AimConfig, "predictionTime", 0, 0.4, 0.01,
         function(x) return string.format("%.2fs", x) end, 4)
 
-    local _, human = makeScrollSection(colL, "HUMANIZE", 2, 174)
+    local _, human = makeSection(colL, "HUMANIZE", 2, 174, true)
     addToggle(human, "Humanize", AimConfig, "humanize", 1)
     addSlider(human, "Jitter", AimConfig, "jitterAmount", 0, 2, 0.05,
         function(x) return string.format("%.2f", x) end, 2)
@@ -1609,7 +1683,7 @@ do
     addSlider(human, "Reaction Delay", AimConfig, "reactionDelay", 0, 0.4, 0.01,
         function(x) return string.format("%.2fs", x) end, 4)
 
-    local _, trig = makeScrollSection(colR, "TRIGGERBOT", 1, 240)
+    local _, trig = makeSection(colR, "TRIGGERBOT", 1, 240, true)
     addSlider(trig, "Trigger Delay", AimConfig, "triggerDelay", 0, 0.3, 0.005,
         function(x) return string.format("%.3fs", x) end, 1)
     addSlider(trig, "Click Hold", AimConfig, "triggerHold", 0.01, 0.2, 0.005,
@@ -1620,7 +1694,7 @@ do
         function(x) return tostring(x) .. " studs" end, 4)
     addToggle(trig, "Only While Aiming", AimConfig, "triggerOnAim", 5)
 
-    local _, silent = makeScrollSection(colR, "SILENT", 2, 148)
+    local _, silent = makeSection(colR, "SILENT", 2, 148, true)
     addCycle(silent, "Transport", AimConfig, "silentMethod",
         {"Mouse", "CFrame", "VirtualInput"}, 1)
     addSlider(silent, "Silent Smooth", AimConfig, "silentSmooth", 0, 1, 0.05,
@@ -1628,7 +1702,69 @@ do
     addToggle(silent, "Wall Check", AimConfig, "wallCheck", 3)
 end
 
--- ---- SETTINGS ------------------------------------------------------------
+-- ---- THEME -------------------------------------------------------------
+do
+    local colL = makeColumn(themePage, 0)
+    local colR = makeColumn(themePage, 1)
+
+    local _, acc = makeSection(colL, "ACCENT", 1, 276, true)
+    addColorPicker(acc, "Accent",      "accent",     1)
+    addColorPicker(acc, "Accent Dim",  "accentDim",  2)
+
+    local _, surf = makeSection(colR, "SURFACES", 1, 276, true)
+    addColorPicker(surf, "Background", "background", 1)
+    addColorPicker(surf, "Sidebar",    "sidebar",    2)
+
+    -- lower half gets its own column pair via a second row of sections
+    local _, txt = makeSection(colL, "TEXT", 2, 168, true)
+    addColorPicker(txt, "Text",     "text",     1)
+    addColorPicker(txt, "Text Dim", "textDim",  2)
+
+    local _, more = makeSection(colR, "ROWS + SECTIONS", 2, 168, true)
+    addColorPicker(more, "Section Box", "section", 1)
+    addColorPicker(more, "Widget Row",  "row",     2)
+
+    -- quick presets live in the sidebar area of the theme page bottom
+    local presetRow = Instance.new("Frame")
+    presetRow.Size = UDim2.new(1, 0, 0, 28)
+    presetRow.BackgroundTransparency = 1
+    presetRow.LayoutOrder = 3
+    presetRow.Parent = makeColumn(themePage, 0)
+    local plist = Instance.new("UIListLayout", presetRow)
+    plist.FillDirection = Enum.FillDirection.Horizontal
+    plist.Padding = UDim.new(0, 4)
+
+    local PRESETS = {
+        {name = "Red",    accent = Color3.fromRGB(255, 50, 50),  dim = Color3.fromRGB(150, 30, 30)},
+        {name = "Cyan",   accent = Color3.fromRGB(0, 220, 220),  dim = Color3.fromRGB(0, 120, 120)},
+        {name = "Green",  accent = Color3.fromRGB(0, 220, 120),  dim = Color3.fromRGB(0, 120, 70)},
+        {name = "Purple", accent = Color3.fromRGB(170, 60, 255), dim = Color3.fromRGB(95, 30, 150)},
+        {name = "Orange", accent = Color3.fromRGB(255, 150, 40), dim = Color3.fromRGB(150, 85, 25)},
+    }
+
+    for _, preset in ipairs(PRESETS) do
+        local pb = Instance.new("TextButton")
+        pb.Size = UDim2.new(0, 52, 1, 0)
+        pb.BackgroundColor3 = preset.accent
+        pb.BorderSizePixel = 0
+        pb.Text = ""
+        pb.AutoButtonColor = false
+        pb.Parent = presetRow
+        Instance.new("UICorner", pb).CornerRadius = UDim.new(0, 4)
+
+        pb.MouseButton1Click:Connect(function()
+            Theme.accent    = preset.accent
+            Theme.accentDim = preset.dim
+            refreshAll()
+        end)
+
+        table.insert(refreshHooks, function()
+            pb.BackgroundColor3 = preset.accent
+        end)
+    end
+end
+
+-- ---- SETTINGS ----------------------------------------------------------
 do
     local colL = makeColumn(cfgPage, 0)
     local colR = makeColumn(cfgPage, 1)
@@ -1646,7 +1782,7 @@ do
     infoLbl.Size = UDim2.new(1, 0, 0, 100)
     infoLbl.BackgroundTransparency = 1
     infoLbl.Text = "collecting"
-    infoLbl.TextColor3 = Color3.fromRGB(180, 180, 180)
+    infoLbl.TextColor3 = Theme.textDim
     infoLbl.Font = Enum.Font.Code
     infoLbl.TextSize = 11
     infoLbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -1665,17 +1801,23 @@ do
     stateLbl.TextYAlignment = Enum.TextYAlignment.Top
     stateLbl.Parent = st
 
+    table.insert(refreshHooks, function()
+        infoLbl.TextColor3 = Theme.textDim
+    end)
+
     task.spawn(function()
         while State.alive do
             task.wait(0.5)
             local backend = useDrawing and "Drawing (native)" or "ScreenGui (fallback)"
-            local targets = 0
-            for _ in next, sets do targets += 1 end
+            local alive = 0
+            for _, k in ipairs(POOL_KINDS) do
+                if poolUse[k] > alive then alive = poolUse[k] end
+            end
 
             pcall(function()
                 infoLbl.Text = string.format(
                     "backend : %s\nplace   : %s\ntargets : %d\nshots   : %d\nuptime  : %ds",
-                    backend, tostring(game.PlaceId), targets,
+                    backend, tostring(game.PlaceId), alive,
                     AimState.shotsFired, math.floor(tick() - State.startTime))
             end)
 
@@ -1686,7 +1828,7 @@ do
                 elseif AimState.active and AimState.lockedTarget then
                     stateLbl.Text = string.format("%s LOCK\n%s",
                         string.upper(AimConfig.mode), AimState.lockedTarget.Name)
-                    stateLbl.TextColor3 = Color3.fromRGB(255, 140, 140)
+                    stateLbl.TextColor3 = Theme.accent
                 elseif AimConfig.enabled then
                     stateLbl.Text = string.format("%s\nfov %d deg",
                         string.upper(AimConfig.mode), AimConfig.fov)
@@ -1701,9 +1843,10 @@ do
 end
 
 selectPage("ESP")
+refreshAll()
 
 -- =========================================================================
--- 13 · SAFETY LOOP + BINDS
+-- 12 · SAFETY LOOP + BINDS
 -- =========================================================================
 task.spawn(function()
     while State.alive do
@@ -1730,7 +1873,9 @@ task.spawn(function()
         if State.alive then
             pcall(function()
                 local n = 0
-                for _ in next, sets do n += 1 end
+                for _, k in ipairs(POOL_KINDS) do
+                    if poolUse[k] > n then n = poolUse[k] end
+                end
                 statusLabel.Text = string.format("armed\n%d targets\n%s", n, string.upper(AimConfig.mode))
                 statusLabel.TextColor3 = Color3.fromRGB(120, 200, 120)
             end)
@@ -1739,7 +1884,6 @@ task.spawn(function()
 end)
 
 UserInputService.InputBegan:Connect(function(i, processed)
-    -- capture wins over every other bind
     if commitCapture(i) then return end
     if processed then return end
 
@@ -1752,12 +1896,8 @@ UserInputService.InputBegan:Connect(function(i, processed)
 
     elseif i.KeyCode == KeyConfig.aimKey then
         State.aimKeyHeld = true
-        if AimConfig.toggleMode then
-            AimConfig.enabled = not AimConfig.enabled
-        else
-            AimConfig.enabled = true
-            AimState.lastAimTime = tick()
-        end
+        AimConfig.enabled = AimConfig.toggleMode and (not AimConfig.enabled) or true
+        AimState.lastAimTime = tick()
         refreshAll()
 
     elseif i.KeyCode == KeyConfig.silentKey then
@@ -1773,6 +1913,8 @@ UserInputService.InputBegan:Connect(function(i, processed)
         end
     end
 end)
+
+local function commitCaptureRun(input) end
 
 UserInputService.InputEnded:Connect(function(i)
     if i.KeyCode == KeyConfig.aimKey then
@@ -1792,6 +1934,7 @@ end)
 local API = {
     Config = Config,
     Aim    = AimConfig,
+    Theme  = Theme,
     Keys   = KeyConfig,
     Team   = Team,
     State  = State,
