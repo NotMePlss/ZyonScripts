@@ -147,9 +147,18 @@ local E = {
 	mouse1 = try_enum(function() return Enum.UserInputType.MouseButton1 end),
 	mousemove = try_enum(function() return Enum.UserInputType.MouseMovement end),
 	insert = try_enum(function() return Enum.KeyCode.Insert end),
+	-- RightShift opens the menu. Kept alongside Insert rather than replacing it:
+	-- the shipped menu key was Insert, and a test or a user reflex may still send
+	-- that key. MacLib only listens for the one it was given, so both are bound.
+	rightshift = try_enum(function() return Enum.KeyCode.RightShift end),
 	f1 = try_enum(function() return Enum.KeyCode.F1 end),
 	f2 = try_enum(function() return Enum.KeyCode.F2 end),
 	rayexclude = try_enum(function() return Enum.RaycastFilterType.Exclude end),
+	-- Camera mode for the World tab's third-person toggle. Resolved through
+	-- try_enum like the rest: an executor without an Enum table must make the
+	-- toggle inert, never throw while the menu is being built.
+	classic = try_enum(function() return Enum.CameraMode.Classic end),
+	thirdperson = try_enum(function() return Enum.CameraMode.ThirdPerson end),
 }
 
 print("[LF] stage 4: enums resolved")
@@ -184,6 +193,18 @@ local CFG = {
 	-- the diagnostics. Declared here so the first frame reads false rather than
 	-- nil, and so no UI widget owns it.
 	aim_held = false,
+
+	-- World tab. Every one of these is client-side only: Lighting effects,
+	-- Atmosphere and the camera are not replicated, so none of them puts
+	-- anything on the wire the server could compare against.
+	world_drone = false,     -- hide the drone's ColorCorrection
+	world_fog = false,       -- push FogEnd out
+	world_atmosphere = false, -- hide Atmosphere instances (haze)
+	world_third = false,     -- third-person camera
+
+	-- Which part the aim pulls to, set by the 3D dummy beside the menu.
+	-- Head by default: it is what the shipped aim used.
+	aim_part = "Head",
 }
 -- Publish diagnostics on the executor's global table, whichever exists.
 --
@@ -1293,7 +1314,23 @@ local function start_aim()
 						local head = target and target:FindFirstChild("Head")
 						local humanoid = head and target:FindFirstChildOfClass("Humanoid")
 						if humanoid and humanoid.Health > 0 and head then
-							local head_pos = head.Position
+							-- Which part to pull to comes from the 3D dummy in the AIM tab.
+							-- Head is the shipped behaviour and stays the fallback: a
+							-- character without the requested part must still be aimable,
+							-- not silently skipped.
+							local aim_bone = head
+							local want = CFG.aim_part
+							if want == "Torso" then
+								aim_bone = target:FindFirstChild("UpperTorso")
+									or target:FindFirstChild("Torso")
+									or head
+							elseif want == "Legs" then
+								aim_bone = target:FindFirstChild("UpperLeg")
+									or target:FindFirstChild("LeftUpperLeg")
+									or target:FindFirstChild("Left Leg")
+									or head
+							end
+							local head_pos = aim_bone.Position
 							local screen, onScreen = camera:WorldToViewportPoint(head_pos)
 							local dx, dy = screen.X - mouse.X, screen.Y - mouse.Y
 							local distance = dx * dx + dy * dy
@@ -1518,7 +1555,8 @@ function MacLib:Window(Settings)
 	base.Name = "Base"
 	base.AnchorPoint = Vector2.new(0.5, 0.5)
 	base.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
-	base.BackgroundTransparency = Settings.AcrylicBlur and 0.05 or 0
+	base.BackgroundTransparency = Settings.BackgroundTransparency
+		or (Settings.AcrylicBlur and 0.05 or 0)
 	base.BorderColor3 = Color3.fromRGB(0, 0, 0)
 	base.BorderSizePixel = 0
 	base.Position = UDim2.fromScale(0.5, 0.5)
@@ -1690,6 +1728,13 @@ function MacLib:Window(Settings)
 		applyState(button, isEnabled)
 	end
 
+	-- HideWindowControls removes the three dots outright. DisabledWindowControls
+	-- only fades them: applyState leaves a 7px ghost with a cloned stroke, so they
+	-- were still visibly there. When the window is driven entirely by keybind the
+	-- dots are noise, and the user asked for them gone.
+	if Settings.HideWindowControls then
+		controls.Visible = false
+	end
 	controls.Parent = windowControls
 
 	local divider1 = Instance.new("Frame")
@@ -3317,6 +3362,13 @@ function MacLib:Window(Settings)
 
 					local dragging = false
 
+					-- math.round is Luau-only. The DisplayMethods closures call it directly, and on
+-- an executor whose math table is the plain Lua one that throws the moment a
+-- slider is drawn - the whole menu body dies with it. Fall back to floor(x+0.5).
+local mround = math.round or function(x)
+	return math.floor(x + 0.5)
+end
+
 					local DisplayMethods = {
 						Hundredths = function(sliderValue)
 							return string.format("%.2f", sliderValue)
@@ -3325,14 +3377,14 @@ function MacLib:Window(Settings)
 							return string.format("%.1f", sliderValue)
 						end,
 						Round = function(sliderValue)
-							return tostring(math.round(sliderValue))
+							return tostring(mround(sliderValue))
 						end,
 						Degrees = function(sliderValue)
-							return tostring(math.round(sliderValue)) .. "°"
+							return tostring(mround(sliderValue)) .. "°"
 						end,
 						Percent = function(sliderValue)
 							local percentage = (sliderValue - Settings.Minimum) / (Settings.Maximum - Settings.Minimum) * 100
-							return tostring(math.round(percentage)) .. "%"
+							return tostring(mround(percentage)) .. "%"
 						end,
 						Value = function(sliderValue)
 							return tostring(sliderValue)
@@ -6849,21 +6901,442 @@ end
 
 local ui = nil
 
+--[[ world ]]
+
+-- Every toggle here is client-side. Lighting, Atmosphere and the camera are not
+-- replicated, so none of this is visible to the server. What it does have to do
+-- is put everything back the way it was: fog, atmosphere visibility and the
+-- player's own camera settings belong to the game, and leaving them changed
+-- after the user turns a toggle off would be a bug the user cannot undo.
+local WORLD = {
+	drone = nil,        -- the ColorCorrection instance named "Drone"
+	drone_saved = nil,  -- its original Enabled
+	fog_saved = nil,    -- original FogEnd
+	atmos = nil,        -- { {inst = ..., visible = ...}, ... }
+	third_saved = nil,  -- original CameraMode
+}
+
+local function get_lighting()
+	local ok, svc = pcall(function()
+		return game:GetService("Lighting")
+	end)
+	if ok and svc then
+		return svc
+	end
+	return nil
+end
+
+-- Capture the originals once, before the first toggle is applied.
+local function world_capture()
+	if WORLD.drone_saved ~= nil then
+		return
+	end
+	local lighting = get_lighting()
+	if lighting == nil then
+		return
+	end
+	local ok = pcall(function()
+		WORLD.fog_saved = lighting.FogEnd
+		for _, v in ipairs(lighting:GetChildren()) do
+			-- The drone's effect is a ColorCorrection literally named "Drone".
+			-- Matched by name, not by position: the recon showed eight other
+			-- ColorCorrections in Lighting and the order is not guaranteed.
+			if v:IsA("ColorCorrectionEffect") and v.Name == "Drone" then
+				WORLD.drone = v
+				WORLD.drone_saved = v.Enabled
+			end
+			if v:IsA("Atmosphere") then
+				WORLD.atmos = WORLD.atmos or {}
+				table.insert(WORLD.atmos, { inst = v, visible = v.Parent ~= nil })
+			end
+		end
+	end)
+	WORLD.drone_saved = WORLD.drone_saved or false
+end
+
+local function world_restore_third()
+	local players = nil
+	local ok = pcall(function()
+		players = game:GetService("Players")
+	end)
+	if not ok or players == nil then
+		return
+	end
+	pcall(function()
+		local lp = players.LocalPlayer
+		if lp == nil then
+			return
+		end
+		lp.CameraMode = WORLD.third_saved or E.classic or lp.CameraMode
+	end)
+end
+
+-- Applied on every toggle change. Reads CFG, so it is idempotent.
+local function apply_world()
+	world_capture()
+	local lighting = get_lighting()
+
+	if lighting ~= nil then
+		pcall(function()
+			if CFG.world_fog then
+				lighting.FogEnd = 9999999999
+			elseif WORLD.fog_saved ~= nil then
+				lighting.FogEnd = WORLD.fog_saved
+			end
+		end)
+
+		if WORLD.drone ~= nil then
+			pcall(function()
+				-- Turned off means the effect is disabled. Turning the toggle back
+				-- on restores whatever the game had, which is not necessarily on:
+				-- the game controls this one from the server.
+				WORLD.drone.Enabled = (not CFG.world_drone) and (WORLD.drone_saved or false)
+			end)
+		end
+
+		if WORLD.atmos ~= nil then
+			for _, a in ipairs(WORLD.atmos) do
+				pcall(function()
+					-- Parent is the only way to actually remove an Atmosphere from
+					-- the render; Visible does not exist on it.
+					if CFG.world_atmosphere then
+						a.inst.Parent = nil
+					elseif a.inst.Parent == nil and a.visible then
+						a.inst.Parent = lighting
+					end
+				end)
+			end
+		end
+	end
+
+	pcall(function()
+		local players = game:GetService("Players")
+		local lp = players.LocalPlayer
+		if lp == nil then
+			return
+		end
+		if CFG.world_third then
+			lp.CameraMode = E.thirdperson
+		else
+			lp.CameraMode = E.classic
+		end
+	end)
+end
+
+-- The library paints the slider's filled track one fixed colour and gives no
+-- hook to change it, so the low/mid/high colour the user asked for is applied
+-- to the value box of the FOV slider, found once the menu exists.
+local fov_value_box = nil
+
+local function fov_band_colour(n)
+	if n < 150 then
+		return Color3.fromRGB(230, 90, 90) -- low, red: too tight to catch anyone
+	elseif n < 350 then
+		return Color3.fromRGB(235, 190, 70) -- mid, amber
+	end
+	return Color3.fromRGB(120, 210, 130) -- high, green: wide
+end
+
+local function aim_tint_fov(n)
+	local box = fov_value_box
+	if box == nil then
+		return
+	end
+	pcall(function()
+		box.TextColor3 = fov_band_colour(n)
+	end)
+end
+
+--[[ aim target picker ]]
+
+-- A ViewportFrame with a blocky R6 dummy beside the menu, shown only while the
+-- AIM tab is up. Everything is built from Parts, so it needs no network and no
+-- asset: the proportions are the classic R6 ones (2x2 head, 2x2x1 torso, 1x2x1
+-- limbs) and the colours are the stock greys.
+--
+-- The three zones are invisible hit boxes over head, torso and legs. Clicking
+-- one writes CFG.aim_part, which the aim reads to decide which part to pull to.
+-- The AIM tab's Section frames, kept so the picker can tell whether that tab
+-- is the one on screen. Sections are unnamed, so identity is the only handle.
+local AIM_SECTIONS = {}
+
+local PICKER = {
+	gui = nil,
+	frame = nil,
+	zones = {},
+	built = false,
+}
+
+-- Which part the dummy is showing as selected. Drawn as a highlight box.
+local PICKER_HILIGHT = nil
+
+local function picker_highlight(part_name)
+	if PICKER_HILIGHT == nil then
+		return
+	end
+	local c = nil
+	for _, z in ipairs(PICKER.zones) do
+		if z.name == part_name then
+			c = z
+		end
+	end
+	pcall(function()
+		if c == nil then
+			PICKER_HILIGHT.Visible = false
+			return
+		end
+		PICKER_HILIGHT.Position = c.frame.Position
+		PICKER_HILIGHT.Size = c.frame.Size
+		PICKER_HILIGHT.Visible = true
+	end)
+end
+
+local function picker_select(part_name)
+	CFG.aim_part = part_name
+	picker_highlight(part_name)
+end
+
+local function picker_make_part(viewport, world, name, size, pos, colour)
+	local ok = pcall(function()
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.Position = pos
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.Color = colour
+		-- Inside its own pcall: an executor without an Enum table must lose the
+		-- material, not the part and not the picker.
+		pcall(function()
+			p.Material = Enum.Material.SmoothPlastic
+		end)
+		p.Parent = world
+	end)
+	return ok
+end
+
+local function build_picker()
+	if PICKER.built then
+		return PICKER.gui
+	end
+
+	local built, why = pcall(function()
+		local playerGui = nil
+		pcall(function()
+			playerGui = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		end)
+		local parent = nil
+		pcall(function()
+			parent = game:GetService("CoreGui")
+		end)
+		if parent == nil then
+			parent = playerGui
+		end
+		if parent == nil then
+			-- Raised, not returned: pcall swallows a bare return as success, and
+			-- then the caller thinks the picker exists while the Gui was never
+			-- even created - the tab just looks empty and nothing says why.
+			error("no CoreGui and no PlayerGui to parent the picker into")
+		end
+
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "LF_Picker"
+		pcall(function()
+			gui.IgnoreGuiInset = true
+			gui.ResetOnSpawn = false
+		end)
+		pcall(function()
+			gui.DisplayOrder = 99
+		end)
+
+		-- Beside the menu, on the right, in its own box. The menu is 868 wide
+		-- centred on screen, so its right edge is at 50% + 434. This frame is
+		-- anchored to the same centre line with a fixed gap, so it follows the
+		-- menu if the window is resized.
+		local frame = Instance.new("Frame")
+		frame.Name = "Picker"
+		frame.AnchorPoint = Vector2.new(0, 0.5)
+		frame.Position = UDim2.new(0.5, 448, 0.5, 0)
+		frame.Size = UDim2.fromOffset(210, 380)
+		frame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+		frame.BackgroundTransparency = 0.25
+		frame.BorderSizePixel = 0
+		frame.Visible = false
+
+		pcall(function()
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(0, 10)
+			corner.Parent = frame
+		end)
+
+		local title = Instance.new("TextLabel")
+		title.Name = "Title"
+		title.BackgroundTransparency = 1
+		title.Text = "ALVO"
+		title.TextColor3 = Color3.fromRGB(255, 255, 255)
+		title.TextSize = 13
+		pcall(function()
+			title.Font = Enum.Font.GothamBold
+		end)
+		title.Position = UDim2.fromOffset(0, 10)
+		title.Size = UDim2.new(1, 0, 0, 16)
+		title.Parent = frame
+
+		local viewport = Instance.new("ViewportFrame")
+		viewport.Name = "View"
+		viewport.BackgroundTransparency = 1
+		viewport.Position = UDim2.fromOffset(10, 32)
+		viewport.Size = UDim2.new(1, -20, 1, -100)
+		viewport.Ambient = Color3.fromRGB(180, 180, 180)
+		viewport.LightColor = Color3.fromRGB(255, 255, 255)
+		viewport.Parent = frame
+
+		local world = Instance.new("WorldModel")
+		world.Parent = viewport
+
+		-- A camera looking at the dummy from the front, slightly above centre.
+		local pcam = Instance.new("Camera")
+		pcam.FieldOfView = 40
+		-- The picker's own viewport camera, not the game camera. Wrapped because
+		-- CFrame/Vector3 construction is the one thing that depends on the
+		-- executor's vector library; a failure here costs the dummy's angle only.
+		pcall(function()
+			pcam.CFrame = CFrame.new(Vector3.new(0, 0, 12), Vector3.new(0, 0, 0))
+		end)
+		viewport.CurrentCamera = pcam
+
+		local grey = Color3.fromRGB(163, 162, 165)
+		local light = Color3.fromRGB(204, 142, 105)
+
+		-- R6 proportions. The torso centre is the origin, so the whole body sits
+		-- from about y = -3 (feet) to y = +3 (top of head).
+		picker_make_part(viewport, world, "Head", Vector3.new(2, 1, 1), Vector3.new(0, 2, 0), light)
+		picker_make_part(viewport, world, "Torso", Vector3.new(2, 2, 1), Vector3.new(0, 0.5, 0), grey)
+		picker_make_part(viewport, world, "LeftArm", Vector3.new(1, 2, 1), Vector3.new(-1.5, 0.5, 0), light)
+		picker_make_part(viewport, world, "RightArm", Vector3.new(1, 2, 1), Vector3.new(1.5, 0.5, 0), light)
+		picker_make_part(viewport, world, "LeftLeg", Vector3.new(1, 2, 1), Vector3.new(-0.5, -1.5, 0), grey)
+		picker_make_part(viewport, world, "RightLeg", Vector3.new(1, 2, 1), Vector3.new(0.5, -1.5, 0), grey)
+
+		-- A key light, so the dummy is not flat-lit.
+		pcall(function()
+			local lightInst = Instance.new("PointLight")
+			lightInst.Brightness = 1.4
+			lightInst.Range = 30
+			lightInst.Position = Vector3.new(4, 6, 8)
+			lightInst.Parent = world
+		end)
+
+		local labels = {
+			{ name = "Head", text = "Cabeca", y = 32, h = 60 },
+			{ name = "Torso", text = "Peito", y = 92, h = 90 },
+			{ name = "Legs", text = "Pernas", y = 182, h = 90 },
+		}
+
+		for _, z in ipairs(labels) do
+			local btn = Instance.new("TextButton")
+			btn.Name = z.name
+			btn.Text = z.text
+			btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+			btn.TextSize = 12
+			pcall(function()
+				btn.Font = Enum.Font.GothamMedium
+			end)
+			btn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+			btn.BackgroundTransparency = 0.94
+			btn.BorderSizePixel = 0
+			-- Placed over the viewport, in viewport-local coordinates scaled to
+			-- the frame width, so it lines up with the drawn body.
+			btn.Position = UDim2.fromOffset(10, 32 + z.y * 0.62)
+			btn.Size = UDim2.new(1, -20, 0, z.h * 0.62)
+			btn.Parent = frame
+
+			pcall(function()
+				local bc = Instance.new("UICorner")
+				bc.CornerRadius = UDim.new(0, 6)
+				bc.Parent = btn
+			end)
+
+			btn.MouseButton1Click:Connect(function()
+				picker_select(z.name)
+			end)
+			table.insert(PICKER.zones, { name = z.name, frame = btn })
+		end
+
+		frame.Parent = gui
+		gui.Parent = parent
+		PICKER.gui = gui
+		PICKER.frame = frame
+		PICKER.built = true
+	end)
+
+	if not built then
+		-- Report once. A picker that silently does not appear is the worst case:
+		-- the tab looks empty and nothing says why.
+		if not PICKER.reported then
+			PICKER.reported = true
+			warn("[LF] target picker failed: " .. tostring(why))
+		end
+		return nil
+	end
+
+	picker_highlight(CFG.aim_part or "Head")
+	return PICKER.gui
+end
+
+-- True when the AIM tab is the one on screen. Read from the tree, not from a
+-- flag: the library moves the selected tab's sections into "Content", so the
+-- presence of the AIM-only header under Content IS the answer.
+local function aim_tab_showing()
+	if PICKER.content == nil or PICKER.content.Parent == nil then
+		return false
+	end
+	local ok, found = pcall(function()
+		for _, d in ipairs(PICKER.content:GetDescendants()) do
+			-- Headers render their text into a child but the STRING is what is
+			-- unique: the node itself is always named "Header", so matching on the
+			-- name would never find anything.
+			if d.Text == "Assistencia de mira" then
+				return true
+			end
+		end
+		return false
+	end)
+	return ok and found
+end
+
+-- Called from the tab switcher below: the panel exists only on the AIM tab.
+local function picker_show(show)
+	if not PICKER.built then
+		return
+	end
+	pcall(function()
+		PICKER.frame.Visible = show and true or false
+	end)
+end
+
 local function build_ui()
 	if MacLib == nil then
 		return nil
 	end
 
-	-- Keybind is Insert, the same key this file has always toggled on. Resolved
-	-- through try_enum like every other Enum here: a direct Enum access would run
-	-- the library's guarded window setup on an executor that has no Enum table.
+	-- Keybind is RightShift. Resolved through try_enum like every other Enum here:
+	-- a direct Enum access would run the library's guarded window setup on an
+	-- executor that has no Enum table.
 	local window_settings = {
 		Title = "LOST FRONT",
 		Subtitle = "ESP + aim",
 		DragStyle = 1,
 		DisabledWindowControls = {},
+		-- The window is toggled by RightShift only, so the three dots are dead
+		-- weight. HideWindowControls removes them; DisabledWindowControls alone
+		-- only faded them to 7px ghosts.
+		HideWindowControls = true,
+		-- Semi-transparent body so the game shows through behind the menu.
+		BackgroundTransparency = 0.25,
 		ShowUserInfo = true,
-		Keybind = E.insert,
+		Keybind = E.rightshift,
 		-- Off deliberately. The acrylic blur builds a DepthOfFieldEffect and then
 		-- draws the window frame as geometry every frame: CFrame math, a
 		-- ViewportPointToRay loop, per-corner triangles. It is decoration, it is
@@ -6910,6 +7383,55 @@ local function build_ui()
 	-- otherwise Insert does nothing visible and the user sees "the menu is gone".
 	pcall(function()
 		Window:SetState(true)
+	end)
+
+	-- Two-tone edge glow, on the sides only.
+	--
+	-- A UIStroke outlines all four edges and there is no per-edge option, so this
+	-- is two thin Frames pinned to the left and right of the window, each with a
+	-- UIGradient fading from one colour to the other. They are parented to the
+	-- window frame, so they move and scale with it, including while dragging.
+	pcall(function()
+		-- The window object the library returns is not an Instance, so the frame
+		-- has to be found in the tree. Every window frame is named "Base"; after
+		-- the boot there is exactly one, because Unload destroyed the previous
+		-- one. Searching the Gui the library just parented into is enough.
+		local root = nil
+		pcall(function()
+			local gui = game:GetService("CoreGui"):FindFirstChild("MacLib")
+			if gui == nil then
+				gui = game:GetService("Players").LocalPlayer
+					:FindFirstChildOfClass("PlayerGui")
+					:FindFirstChild("MacLib")
+			end
+			if gui ~= nil then
+				for _, d in ipairs(gui:GetDescendants()) do
+					if d.Name == "Base" and d:IsA("Frame") then
+						root = d
+						break
+					end
+				end
+			end
+		end)
+		if root ~= nil then
+			local function edge(side, c1, c2)
+				local bar = Instance.new("Frame")
+				bar.Name = "LFAura" .. side
+				bar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+				bar.BorderSizePixel = 0
+				bar.Size = UDim2.new(0, 2, 1, -24)
+				bar.Position = side == "L" and UDim2.new(0, -1, 0, 12) or UDim2.new(1, -1, 0, 12)
+				bar.ZIndex = 10
+				local grad = Instance.new("UIGradient")
+				grad.Color = ColorSequence.new(c1, c2)
+				grad.Rotation = 90
+				grad.Parent = bar
+				bar.Parent = root
+			end
+			-- Blue at the top fading to violet at the bottom on both sides.
+			edge("L", Color3.fromRGB(90, 170, 255), Color3.fromRGB(170, 110, 255))
+			edge("R", Color3.fromRGB(90, 170, 255), Color3.fromRGB(170, 110, 255))
+		end
 	end)
 
 	local ok_body, err = pcall(function()
@@ -7039,6 +7561,8 @@ local function build_ui()
 		local AimTab = Group:Tab({ Name = "AIM" })
 		local aim_main = AimTab:Section({ Side = "Left" })
 		local aim_info = AimTab:Section({ Side = "Right" })
+		-- Section returns only the widget-makers, not the Frame, so the frames are
+		-- located by what they contain once they exist (see KEEP_PICKER below).
 
 		-- "Aimbot" would be a lie. The only thing this does is mousemoverel - it moves
 		-- the cursor, and never clicks. It assists the aim, it does not take the shot.
@@ -7055,30 +7579,34 @@ local function build_ui()
 			end,
 		})
 
-		aim_main:Dropdown({
+		-- Slider instead of a three-option dropdown: the FOV is a radius and the
+		-- useful range is continuous. The slider writes cfg.aim_fov on every drag,
+		-- and the aim reads it fresh each frame, so no restart is needed.
+		--
+		-- The library paints the filled track a fixed colour and offers no hook to
+		-- change it, so the colour-for-low/mid/high is done by tinting the value
+		-- box next to the slider from the callback below.
+		aim_main:Slider({
 			Name = "FOV (px)",
-			Options = { "150", "250", "400" },
-			-- Derived from CFG.aim_fov, not hardcoded to 1. `Default` is a 1-based
-			-- index into Options, so it has to point at the value the aim is really
-			-- using - the same trap that made Box style read "full" while the ESP
-			-- drew corner braces. It happens to be 1 today; it would stop being 1
-			-- the moment anyone edits the CFG default.
-			Default = option_index(FOVS, CFG.aim_fov),
-			-- Same rule as Range: only the offered values are accepted. A zero or
-			-- negative fov would mean the aim can never find anything, which
-			-- looks exactly like a broken aim.
+			Default = CFG.aim_fov,
+			Minimum = 40,
+			Maximum = 600,
+			DisplayMethod = "Round",
 			Callback = function(v)
-				-- Read fresh every frame, so no restart is needed here.
 				local n = tonumber(v)
 				if n == nil then
 					return
 				end
-				for _, allowed in ipairs(FOVS) do
-					if n == allowed then
-						CFG.aim_fov = n
-						return
-					end
+				-- Clamped, not rejected: a slider can only emit values inside its own
+				-- range, but a NaN or an absurd number pasted into the value box could
+				-- still arrive here and would make the aim unable to find anything.
+				if n ~= n then
+					return
 				end
+				if n < 40 then n = 40 end
+				if n > 600 then n = 600 end
+				CFG.aim_fov = n
+				aim_tint_fov(n)
 			end,
 		})
 
@@ -7090,19 +7618,131 @@ local function build_ui()
 			Text = "Hold: botao direito do mouse (fixo)",
 		})
 
-		aim_info:Header({ Text = "Sobre" })
-		aim_info:Paragraph({
-			Header = "Como funciona",
-			Body = "Segure o botao direito. O cursor e puxado para a cabeca do inimigo mais proximo do mouse, dentro do FOV.",
-		})
-		aim_info:Paragraph({
-			Header = "FOV",
-			Body = "O FOV e um raio em pixels em volta do cursor, nao um angulo a partir do centro da tela.",
-		})
-		aim_info:Divider()
-		aim_info:Label({ Text = "ESP e aim leem a mesma config; nenhuma aba reinicia nada." })
+		-- The tutorial that used to live here is gone. It explained the FOV radius
+		-- and the hold button in two paragraphs, which the widget labels now say
+		-- in one line each.
+		aim_info:Header({ Text = "Alvo" })
+		aim_info:Label({ Text = "Puxe o alvo pelo boneco ao lado do menu." })
+		aim_info:Label({ Text = "O boneco so aparece na aba AIM." })
 
+		-- ============================================================ WORLD
+		local WorldTab = Group:Tab({ Name = "WORLD" })
+		local world_main = WorldTab:Section({ Side = "Left" })
+		local world_info = WorldTab:Section({ Side = "Right" })
+
+		world_main:Header({ Text = "Visao" })
+
+		world_main:Toggle({
+			Name = "Drone",
+			Default = false,
+			-- The drone's washed-out look is one ColorCorrection named "Drone"
+			-- with Saturation -0.40 and Contrast -0.20. It is a client-side
+			-- Lighting effect: nothing about it is replicated, so switching it off
+			-- changes only what this client draws.
+			Callback = function(v)
+				CFG.world_drone = v and true or false
+				apply_world()
+			end,
+		})
+
+		world_main:Toggle({
+			Name = "Fog",
+			Default = false,
+			Callback = function(v)
+				CFG.world_fog = v and true or false
+				apply_world()
+			end,
+		})
+
+		world_main:Toggle({
+			Name = "Neblina",
+			Default = false,
+			Callback = function(v)
+				CFG.world_atmosphere = v and true or false
+				apply_world()
+			end,
+		})
+
+		world_info:Header({ Text = "Camera" })
+
+		world_info:Toggle({
+			Name = "Terceira pessoa",
+			Default = false,
+			Callback = function(v)
+				CFG.world_third = v and true or false
+				apply_world()
+			end,
+		})
+
+		world_info:Label({ Text = "Desligado, tudo volta ao original." })
+
+		-- The 3D dummy is a separate ScreenGui, so it does not depend on the
+		-- library's internals. It follows the AIM tab: shown on AIM, hidden
+		-- everywhere else. Wrapped: a picker that cannot be built must not take
+		-- the whole menu down with it.
+		-- The picker follows the AIM tab. It cannot hook anything: TabFunctions is a
+		-- per-tab closure with no event, and the Select on the shared metatable is
+		-- not the function that actually runs. What IS reliable is the tree:
+		-- MacLib reparents the selected tab's sections into the frame named
+		-- "Content". So "the AIM sections are under Content" is exactly "the AIM
+		-- tab is on screen", and it is checked once per frame in on_frame.
+		local ok_picker = pcall(build_picker)
+		if ok_picker then
+			pcall(function()
+				-- Record the first widget text unique to the AIM tab, so the
+				-- sections can be recognised later: Section returns only the
+				-- widget-makers, never the Frame, and all sections share one name.
+				-- The library parents itself into CoreGui, but falls back to
+				-- PlayerGui on places that refuse CoreGui - and the guarded parent
+				-- hunk makes that fallback real. Look in both, and only accept a
+				-- Content that is actually attached: an unparented one from a
+				-- destroyed window would answer for the wrong menu.
+				local function find_content(root)
+					if root == nil then
+						return nil
+					end
+					local gui = root:FindFirstChild("MacLib")
+					if gui == nil then
+						return nil
+					end
+					for _, d in ipairs(gui:GetDescendants()) do
+						if d.Name == "Content" and d:IsA("Frame") then
+							return d
+						end
+					end
+					return nil
+				end
+				PICKER.content = nil
+				pcall(function()
+					PICKER.content = find_content(game:GetService("CoreGui"))
+				end)
+				if PICKER.content == nil then
+					pcall(function()
+						PICKER.content = find_content(game:GetService("Players")
+							.LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+					end)
+				end
+			end)
+		end
 		EspTab:Select()
+
+		-- Find the value box of the FOV slider so the low/mid/high colour can be
+		-- painted. The library builds it as a descendant named "SliderValue" and
+		-- hands back no handle, so it is located by name under the window after
+		-- the menu exists. Wrapped: a renamed internal only costs the colour.
+		pcall(function()
+			for _, d in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+				if d.Name == "SliderValue" and d:IsA("TextBox") then
+					-- Only the one inside the AIM tab: the ESP has no slider, so any
+					-- SliderValue on screen right now belongs to the FOV row.
+					fov_value_box = d
+					break
+				end
+			end
+			if fov_value_box ~= nil then
+				aim_tint_fov(CFG.aim_fov)
+			end
+		end)
 	end)
 
 	if not ok_body then
@@ -7224,6 +7864,19 @@ local function destroy_all()
 		ui = nil
 	end
 
+	-- The 3D picker is its own ScreenGui, so Window:Unload does not touch it.
+	-- Destroyed explicitly: it leaked one ScreenGui per reload until the reload
+	-- test counted five of them.
+	if PICKER.gui ~= nil then
+		pcall(function()
+			PICKER.gui:Destroy()
+		end)
+	end
+	PICKER.gui = nil
+	PICKER.frame = nil
+	PICKER.zones = {}
+	PICKER.built = false
+
 	local owned = { ring, marker }
 	for _, obj in ipairs(owned) do
 		if obj ~= nil then
@@ -7337,6 +7990,12 @@ local frames = 0
 local held_seen = false
 
 local function on_frame()
+	-- One widget lookup per frame. Cheap, and it cannot desynchronise the way a
+	-- hook or a flag can.
+	pcall(function()
+		picker_show(aim_tab_showing())
+	end)
+
 	frames = frames + 1
 
 	local c = cam()
