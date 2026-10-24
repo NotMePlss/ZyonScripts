@@ -1857,8 +1857,38 @@ local function start_aim()
 			local fov = CFG.aim_fov
 
 			local ok_frame, e = pcall(function()
-				local mouse = UIS:GetMouseLocation()
+				-- The two coordinate spaces this loop mixes are NOT the same.
+				--
+				--   * WorldToViewportPoint returns SCREEN space: origin at the
+				--     top-left, Y growing downward, matching the viewport.
+				--   * UserInputService:GetMouseLocation returns MOUSE space: origin
+				--     at the BOTTOM-left, Y growing upward, so its Y is
+				--     viewport.Y - screenY.
+				--
+				-- Subtracting one from the other without converting meant every
+				-- target scored an error of roughly the viewport height on Y:
+				-- measured live at 1920x1009 with the cursor mid-screen, the mouse
+				-- read 924,1008 while a dead-centre target projected to 960,504.
+				-- dy was ~500 px for a target the cursor was sitting on, the fov
+				-- test (150 px) rejected everything, and the aim never pulled - it
+				-- looked like the feature had been deleted.
+				--
+				-- Converted once here, so everything below compares screen to
+				-- screen. mouse_raw stays available for anything that needs the
+				-- original value.
+				local mouse_raw = UIS:GetMouseLocation()
+				local viewport = WS.CurrentCamera and WS.CurrentCamera.ViewportSize
+				local mouse = mouse_raw
+				if viewport ~= nil then
+					local ok_conv = pcall(function()
+						mouse = Vector2.new(mouse_raw.X, viewport.Y - mouse_raw.Y)
+					end)
+					if not ok_conv then
+						mouse = mouse_raw
+					end
+				end
 				aim_state.mouse = mouse
+				aim_state.mouse_raw = mouse_raw
 
 				local character = LP and LP.Character
 				if not character or not UIS:IsMouseButtonPressed(AIM_BUTTON) then
@@ -9443,7 +9473,17 @@ local function on_frame()
 		local okm, loc = pcall(function()
 			return UIS:GetMouseLocation()
 		end)
-		if okm then
+		if okm and loc ~= nil then
+			-- Same conversion the aim loop does: GetMouseLocation is mouse space
+			-- (Y up from the bottom), the reticle is drawn in screen space (Y down
+			-- from the top). Without this the circle sat mirrored across the
+			-- middle of the screen from where the aim was actually measuring.
+			local vp = WS.CurrentCamera and WS.CurrentCamera.ViewportSize
+			if vp ~= nil then
+				pcall(function()
+					loc = Vector2.new(loc.X, vp.Y - loc.Y)
+				end)
+			end
 			mouse = loc
 			aim_state.mouse = loc
 		end
