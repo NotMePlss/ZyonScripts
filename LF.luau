@@ -218,6 +218,12 @@ local CFG = {
 	world_fog = false,       -- push FogEnd out
 	world_atmosphere = false, -- hide Atmosphere instances (haze)
 	world_third = false,     -- third-person camera
+	-- Lighting.Brightness override. Killing the fog and the atmosphere removes the
+	-- haze that was scattering light, and the map reads as too dark. This raises
+	-- the brightness to a value the user picks, and restores the captured original
+	-- when switched off.
+	world_bright = false,
+	world_bright_value = 3,
 	-- Which part the aim pulls to, set by the 3D dummy beside the menu.
 	-- Head by default: it is what the shipped aim used.
 	aim_part = "Head",
@@ -385,20 +391,68 @@ local RIG_FOLDER_NAMES = {
 	"lIIooolll",
 }
 
+-- Every folder under Workspace that holds player rigs.
+--
+-- The game does not keep one: measured in a 21-player server, the rigs were split
+-- 7/7 across two sibling folders with different hashes (lIIooolll and IIoooIIl)
+-- inside the same wrapper. Looking a player up in the FIRST folder that exists and
+-- stopping there - which is what this did - found the 7 in one folder and silently
+-- returned nil for everyone in the other, so half the server had no box, no glow,
+-- no name, nothing.
+--
+-- The list is rebuilt per lookup rather than cached: two folders, a dozen children
+-- each, and the wrapper is renamed between servers. Cheap enough at one lookup per
+-- player per frame, and it cannot go stale.
+local function rig_roots()
+	local roots = {}
+	-- `workspace` is a global, and it is not guaranteed to exist. Reading it
+	-- directly threw "attempt to index global 'workspace'" on every player on
+	-- every frame in the harness, which is exactly the sort of thing that has no
+	-- business being able to kill the render loop. Resolved defensively, with the
+	-- service as a fallback for the case where the global is missing.
+	local ws = nil
+	pcall(function()
+		ws = workspace
+	end)
+	if ws == nil then
+		pcall(function()
+			ws = game:GetService("Workspace")
+		end)
+	end
+	if ws == nil then
+		return roots
+	end
+	-- Wrapped: nothing about a missing method on the world object should be able to
+	-- take the render loop down. A lookup that cannot be done yields no roots, which
+	-- is the same answer as "no rig found".
+	pcall(function()
+		for _, folder_name in ipairs(RIG_FOLDER_NAMES) do
+			local folder = ws:FindFirstChild(folder_name)
+			if folder ~= nil then
+				table.insert(roots, folder)
+				for _, sub in ipairs(folder:GetChildren()) do
+					table.insert(roots, sub)
+				end
+			end
+		end
+	end)
+	pcall(function()
+		for _, folder in ipairs(ws:GetChildren()) do
+			if folder:FindFirstChildOfClass("Humanoid") == nil then
+				table.insert(roots, folder)
+			end
+		end
+	end)
+	return roots
+end
+
 local function rig_of_char(p)
 	if p == nil then
 		return nil
 	end
-	for _, folder_name in ipairs(RIG_FOLDER_NAMES) do
-		local folder = workspace:FindFirstChild(folder_name)
-		local rig = folder and folder:FindFirstChild(p.Name)
-		if rig ~= nil and rig:FindFirstChildOfClass("Humanoid") ~= nil then
-			return rig
-		end
-	end
-	-- RIG_FOLDER_NAMES is a hint, not the whole truth: the folder hash changes
-	-- between servers. A shallow sweep of Workspace children covers a rename.
-	for _, folder in ipairs(workspace:GetChildren()) do
+	-- Every candidate is tried; the first rig with a Humanoid wins. Stopping at the
+	-- first folder that happened to exist is what hid half the server.
+	for _, folder in ipairs(rig_roots()) do
 		local rig = folder:FindFirstChild(p.Name)
 		if rig ~= nil and rig:FindFirstChildOfClass("Humanoid") ~= nil then
 			return rig
@@ -1162,6 +1216,21 @@ local function draw_player(p, my_pos)
 	if char then
 		hum, head, root = rig_of(char)
 	end
+	-- Player.Character is not always the body. Measured in a 21-player server:
+	-- several players had a Character with one or four children and no Humanoid -
+	-- a stub - while their full rig (Humanoid, root, head) sat in the rig folder.
+	-- rig_of returned nil for those, so they got no box, no name, no glow, and
+	-- nothing said why. rig_of_char is the resolver that knows about the folder
+	-- layout, and this is the one place that needed it and did not call it.
+	if root == nil then
+		local folder_rig = rig_of_char(p)
+		if folder_rig ~= nil and folder_rig ~= char then
+			local fh, fhead, froot = rig_of(folder_rig)
+			if froot ~= nil then
+				char, hum, head, root = folder_rig, fh, fhead, froot
+			end
+		end
+	end
 
 	local s = state[p]
 	local c = cam()
@@ -1195,15 +1264,82 @@ local function draw_player(p, my_pos)
 		end
 	end
 
+	-- Glow runs here, before the projection gate below.
+	--
+	-- It used to live after it, which meant the glow was only applied to players
+	-- that projected on screen, and turned off for everyone else. Measured on a
+	-- 21-player server: the players whose rig happened to be outside the viewport
+	-- had no glow at all, and the ones on screen did - nothing to do with who was
+	-- an enemy. A glow is a world-space effect; it does not care where the camera
+	-- is pointing. Its rule is the one the user asked for: alive, in range, and not
+	-- a teammate.
+	--
+	-- s.hl is created lazily and reused, so this is cheap on the frames where
+	-- nothing changed. `char` is the rig resolved above, which may be the folder
+	-- copy rather than Player.Character.
+	if CFG.esp_glow and char ~= nil then
+		local glow_dist = 0
+		if root ~= nil and my_pos ~= nil then
+			glow_dist = (root.Position - my_pos).Magnitude
+		end
+		local glow_friendly = CFG.esp_team and ally_cached(p)
+		local glow_wanted = glow_dist <= CFG.esp_range and not glow_friendly
+		local gcol = glow_wanted and Color3.fromRGB(
+			CFG.esp_color_enemy[1], CFG.esp_color_enemy[2], CFG.esp_color_enemy[3])
+		if glow_wanted and CFG.esp_rgb then
+			gcol = Color3.fromHSV((os.clock() * CFG.esp_rgb_speed) % 1, 1, 1)
+		end
+		-- The Highlight lives on the character, not in the ESP slot. Tying it to
+		-- the slot meant a player with no slot yet - slots are handed out one per
+		-- frame - had no glow for as long as the queue was behind, and the glow
+		-- vanished the moment the ESP was toggled off. Reading it off `char` makes
+		-- it independent of the drawing state, which is what a world-space glow is.
+		local have_hl = char:FindFirstChild("LF_Glow")
+		if s ~= nil then s.hl = have_hl end
+		if glow_wanted then
+			if s == nil or s.hl == nil or s.hl.Parent ~= char then
+				pcall(function()
+					if have_hl ~= nil then
+						have_hl:Destroy()
+					end
+					local hl = Instance.new("Highlight")
+					hl.Name = "LF_Glow"
+					hl.FillColor = Color3.fromRGB(
+						CFG.esp_glow_color[1], CFG.esp_glow_color[2], CFG.esp_glow_color[3])
+					hl.OutlineColor = gcol
+					hl.FillTransparency = CFG.esp_glow_transparency
+					hl.OutlineTransparency = 0.15
+					pcall(function()
+						hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					end)
+					hl.Parent = char
+					if s ~= nil then s.hl = hl end
+					have_hl = hl
+				end)
+			end
+			local live = char:FindFirstChild("LF_Glow")
+			if live ~= nil then
+				pcall(function()
+					live.Enabled = true
+					live.OutlineColor = gcol
+				end)
+				if s ~= nil then s.hl = live end
+			end
+		else
+			local off = char:FindFirstChild("LF_Glow")
+			if off ~= nil then
+				pcall(function() off.Enabled = false end)
+			end
+		end
+	end
+
 	if not pos then
 		if s then
 			hide(s)
-			-- The glow is an instance on the character, not a Drawing, so hiding
-			-- the slot does not touch it. It has to be turned off here or a player
-			-- who walks out of range keeps glowing at the last place they were.
-			if s.hl ~= nil and s.hl.Parent ~= nil then
-				pcall(function() s.hl.Enabled = false end)
-			end
+			-- The glow is NOT turned off here any more. It used to be, and that was
+			-- the bug: a player off screen or out of range lost the glow even while
+			-- standing alive in plain sight of the world. The glow has its own rule
+			-- below - alive, in range, enemy - and it runs before this early return.
 		end
 		return
 	end
@@ -1231,45 +1367,6 @@ local function draw_player(p, my_pos)
 		col = Color3.fromHSV((os.clock() * CFG.esp_rgb_speed) % 1, 1, 1)
 	end
 
-	-- Glow: a Highlight on the character. Client-side only - a Highlight created
-	-- locally is not replicated and does not touch the character's appearance on
-	-- the server, which is why this one is safe to add where a client-side BodyGlow
-	-- or a material change would not be. Created lazily, once per slot, and reused;
-	-- the same instance follows the player across respawns because it is parented
-	-- to whatever character they have right now.
-	if CFG.esp_glow then
-		if s.hl == nil or s.hl.Parent ~= char then
-			pcall(function()
-				if s.hl ~= nil then
-					s.hl:Destroy()
-				end
-				local hl = Instance.new("Highlight")
-				hl.Name = "LF_Glow"
-				hl.FillColor = Color3.fromRGB(
-					CFG.esp_glow_color[1], CFG.esp_glow_color[2], CFG.esp_glow_color[3])
-				hl.OutlineColor = col
-				hl.FillTransparency = CFG.esp_glow_transparency
-				hl.OutlineTransparency = 0.15
-				-- Best-effort: an executor whose Enum table lacks HighlightDepthMode
-				-- would throw here, and the glow is still worth having without it.
-				pcall(function()
-					hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-				end)
-				hl.Parent = char
-				s.hl = hl
-			end)
-		end
-		if s.hl ~= nil and s.hl.Parent ~= nil then
-			pcall(function()
-				s.hl.Enabled = true
-				-- The fill stays put; only the rim follows the ESP colour, so a
-				-- rainbow enemy glows in the same hue as their box.
-				s.hl.OutlineColor = col
-			end)
-		end
-	elseif s.hl ~= nil and s.hl.Parent ~= nil then
-		pcall(function() s.hl.Enabled = false end)
-	end
 
 	-- Box styles: 1 = full box, 2 = corner braces. Only one is drawn at a time;
 	-- leaving the other set visible from a previous frame is how you get a box
@@ -7439,6 +7536,12 @@ local WORLD = {
 	-- Player.CameraMaxZoomDistance as the game had it, so third person off puts
 	-- the zoom range back instead of leaving it wide.
 	zoom_saved = nil,
+	-- Lighting.Brightness as the game had it. Removing the fog and the atmosphere
+	-- leaves the scene lit only by whatever the map's own lights do, which reads
+	-- as "escuro demais" once the haze that was scattering light is gone. The
+	-- brightness toggle is the answer to that, and it has to restore the exact
+	-- original number, not a guessed one.
+	brightness_saved = nil,
 }
 
 local function get_lighting()
@@ -7462,6 +7565,7 @@ local function world_capture()
 	end
 	local ok = pcall(function()
 		WORLD.fog_saved = lighting.FogEnd
+		WORLD.brightness_saved = lighting.Brightness
 		for _, v in ipairs(lighting:GetChildren()) do
 			-- The drone's effect is a ColorCorrection literally named "Drone".
 			-- Matched by name, not by position: the recon showed eight other
@@ -7507,6 +7611,18 @@ local function apply_world()
 				lighting.FogEnd = 9999999999
 			elseif WORLD.fog_saved ~= nil then
 				lighting.FogEnd = WORLD.fog_saved
+			end
+		end)
+
+		-- Brightness. Killing the fog and the atmosphere removes the haze that was
+		-- scattering light, and the map goes dark. Restoring means putting the
+		-- captured number back rather than subtracting the boost, so a slider moved
+		-- around a dozen times still returns to exactly what the game had.
+		pcall(function()
+			if CFG.world_bright then
+				lighting.Brightness = math.clamp(CFG.world_bright_value or 3, 0, 10)
+			elseif WORLD.brightness_saved ~= nil then
+				lighting.Brightness = WORLD.brightness_saved
 			end
 		end)
 
@@ -7654,6 +7770,26 @@ end
 -- The AIM tab's Section frames, kept so the picker can tell whether that tab
 -- is the one on screen. Sections are unnamed, so identity is the only handle.
 local AIM_SECTIONS = {}
+
+-- Body-part options for the AIM tab, in Portuguese. The value stored in
+-- CFG.aim_part stays the internal English name, because the aim loop and the 3D
+-- dummy's hit zones both match on it; these two tables translate at the edges so
+-- nothing downstream has to know about the labels.
+-- Order matters: it is the order the dropdown lists and the order its 1-based
+-- index maps through.
+local AIM_PART_LABELS = { "Cabeca", "Tronco", "Pernas" }
+
+local AIM_PART_BY_LABEL = {
+	["Cabeca"] = "Head",
+	["Tronco"] = "Torso",
+	["Pernas"] = "Legs",
+}
+
+local AIM_PART_LABEL = {
+	Head = "Cabeca",
+	Torso = "Tronco",
+	Legs = "Pernas",
+}
 
 local PICKER = {
 	gui = nil,
@@ -7895,6 +8031,10 @@ end
 local MENU = {
 	root = nil,
 	applied = false,
+	-- The Window handle returned by MacLib:Window. apply_theme needs it for
+	-- Window:SetScale - the library's BaseUIScale is the only UIScale that has any
+	-- effect on the window, so scale has to go through this.
+	window = nil,
 }
 
 -- True when the AIM tab is the one on screen. Read from the tree, not from a
@@ -8003,30 +8143,39 @@ local function apply_theme()
 	local alpha = math.clamp((CFG.ui_opacity or 100) / 100, 0.10, 1)
 	local base_transparency = 1 - alpha
 
+	-- The Base frame, resolved once for the whole function. menu_root() already
+	-- returns Base when it can; only a ScreenGui answer needs the extra lookup.
+	local base = root
+	if base.Name ~= "Base" then
+		base = root:FindFirstChild("Base") or base
+	end
+
 	pcall(function()
-		-- menu_root() already resolves to Base when it can; only look for a nested
-		-- Base when it handed back the MacLib ScreenGui itself. Reading
-		-- root:FindFirstChild("Base") unconditionally meant Base was nil on the
-		-- normal path, the whole block was skipped, and scale/opacity/themes never
-		-- applied even though the RGB accent pass right after it did.
-		local base = root
-		if base.Name ~= "Base" then
-			base = root:FindFirstChild("Base") or base
-		end
 		if base ~= nil then
 			base.BackgroundColor3 = body
 			base.BackgroundTransparency = base_transparency
-			-- Scale. The library sizes Base from the window settings in pixels, so
-			-- the multiplier is folded into a UIScale child instead of recomputing
-			-- the size - a UIScale scales everything, including text, which is what
-			-- "escala da UI" means.
-			local scale = base:FindFirstChild("LF_Scale")
-			if scale == nil then
-				scale = Instance.new("UIScale")
-				scale.Name = "LF_Scale"
-				scale.Parent = base
+			-- Scale.
+			--
+			-- The first attempt added a second UIScale named LF_Scale next to the
+			-- library's own BaseUIScale. Two sibling UIScales do not multiply - the
+			-- last one wins - so the new one was inert and the slider did nothing.
+			-- The library already exposes Window:SetScale, which drives BaseUIScale;
+			-- that is the handle to use. Fall back to the instance directly for the
+			-- case where the Window handle did not survive.
+			local wanted = math.clamp(CFG.ui_scale or 1, 0.6, 1.4)
+			local via_window = false
+			if MENU.window ~= nil then
+				local okw = pcall(function()
+					MENU.window:SetScale(wanted)
+				end)
+				via_window = okw
 			end
-			scale.Scale = math.clamp(CFG.ui_scale or 1, 0.6, 1.4)
+			if not via_window then
+				local base_scale = base:FindFirstChild("BaseUIScale")
+				if base_scale ~= nil then
+					base_scale.Scale = wanted
+				end
+			end
 
 			-- The library paints the window with a nameless Frame that covers ~97%
 			-- of Base at near-full opacity and opaque black. Colouring Base alone
@@ -8050,27 +8199,51 @@ local function apply_theme()
 	-- Accent pass: strokes, toggles, sliders, the selected tab underline and the
 	-- window controls all carry the accent. Matched by name, which is stable
 	-- across the library version this file vendors.
+	-- Accent pass.
+	--
+	-- Two different things share the word "accent" and the first version of this
+	-- code treated them as one, which is why RGB painted the buttons instead of the
+	-- border:
+	--
+	--   * the widget accent (toggle heads, slider fills, stroked rows) always takes
+	--     the THEME colour. It must not cycle, otherwise the menu reads as broken
+	--     rather than themed.
+	--   * the border - the outline around the window itself - is what RGB drives.
+	--     Only the outer strokes and the aura bars cycle.
+	local widget_accent = rgb3(theme.accent)
+	local border_accent = accent
 	pcall(function()
 		for _, d in ipairs(root:GetDescendants()) do
 			local n = d.Name
 			if n == "UIStroke" or n:find("UIStroke") then
 				if d:IsA("UIStroke") then
-					d.Color = accent
+					-- The window's own outline is the one that cycles; a stroke on an
+					-- inner row keeps the theme colour so text stays readable.
+					local outer = false
+					local p = d.Parent
+					while p ~= nil and p ~= root do
+						if p.Name == "Base" then
+							outer = true
+							break
+						end
+						p = p.Parent
+					end
+					d.Color = outer and border_accent or widget_accent
 				end
 			elseif n == "TogglerHead" then
 				if d:IsA("ImageLabel") or d:IsA("Frame") then
-					d.ImageColor3 = accent
+					d.ImageColor3 = widget_accent
 				end
 			elseif n == "Toggle" and d:IsA("ImageButton") then
 				-- The track stays dark; only the lit state carries the accent and the
 				-- library tweens that itself, so it is left alone here.
 			elseif n == "SliderFill" or n == "Fill" then
 				if d:IsA("Frame") then
-					d.BackgroundColor3 = accent
+					d.BackgroundColor3 = widget_accent
 				end
 			elseif n == "TabSwitcherUIStroke" then
 				if d:IsA("UIStroke") then
-					d.Color = accent
+					d.Color = widget_accent
 				end
 			elseif n == "Sidebar" or n == "TabSwitcher" or n == "ElementsScrolling"
 				or n == "Content" or n == "Topbar" or n == "Elements" or n == "Information"
@@ -8094,23 +8267,52 @@ local function apply_theme()
 		end
 	end)
 
-	-- The aura bars are separate frames this file owns, parented to Base. They
-	-- read the accent so the glow is always the theme colour.
+	-- Window frame ring.
+	--
+	-- This is what "RGB em volta da UI" means: one frame wrapped around the whole
+	-- window, whose stroke cycles. The earlier version recoloured every UIStroke and
+	-- slider fill in the tree, which painted the buttons instead of the border - the
+	-- exact thing that read as wrong.
+	--
+	-- Built once and kept parented to Base, sized to Base, sitting behind the
+	-- content (ZIndex 0) so it only shows as a ring. The two gradient bars that were
+	-- referenced here before were never actually created, which is why the aura
+	-- never appeared; the ring replaces them.
 	pcall(function()
-		local base = root:FindFirstChild("Base")
-		if base == nil then
-			return
+		local ring = base:FindFirstChild("LF_Ring")
+		if ring == nil then
+			ring = Instance.new("Frame")
+			ring.Name = "LF_Ring"
+			ring.BackgroundTransparency = 1
+			ring.BorderSizePixel = 0
+			ring.ZIndex = 0
+			ring.Size = UDim2.fromScale(1, 1)
+			ring.Position = UDim2.fromScale(0, 0)
+			ring.Parent = base
+			local stroke = Instance.new("UIStroke")
+			stroke.Name = "LF_RingStroke"
+			stroke.Thickness = 2
+			-- Resolved through try_enum like every other Enum here: a raw Enum
+			-- access throws on an executor that has no Enum table, and this runs on
+			-- the theme pass, so it would take the whole menu styling down.
+			pcall(function()
+				stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			end)
+			stroke.Parent = ring
 		end
-		for _, nome in ipairs({ "LFAuraL", "LFAuraR" }) do
-			local bar = base:FindFirstChild(nome)
-			if bar ~= nil then
-				bar.Visible = true
-				local grad = bar:FindFirstChildOfClass("UIGradient")
-				if grad ~= nil then
-					grad.Color = ColorSequence.new(accent, Color3.fromRGB(170, 110, 255))
-				end
-			end
+		local stroke = ring:FindFirstChild("LF_RingStroke")
+		if stroke ~= nil then
+			stroke.Color = border_accent
+			stroke.Transparency = 0
 		end
+		-- The ring has to follow Base if the window is scaled or dragged.
+		local sc = ring:FindFirstChild("LF_RingScale")
+		if sc == nil then
+			sc = Instance.new("UIScale")
+			sc.Name = "LF_RingScale"
+			sc.Parent = ring
+		end
+		sc.Scale = 1
 	end)
 end
 
@@ -8186,6 +8388,9 @@ local function build_ui()
 	end
 
 	local W = {}
+	-- Kept for apply_theme: Window:SetScale is the only handle that moves the
+	-- library's BaseUIScale, and that is the UIScale that actually scales the menu.
+	MENU.window = Window
 
 	-- The window's own keybind must be the same key this file already toggles on,
 	-- otherwise Insert does nothing visible and the user sees "the menu is gone".
@@ -8520,6 +8725,30 @@ local function build_ui()
 		-- in one line each.
 		aim_info:Header({ Text = "Alvo" })
 
+		-- Which body part the aim pulls to. The stored value is the internal name
+		-- (Head / Torso / Legs) because that is what the aim loop and the 3D dummy
+		-- both match on; only the labels are Portuguese, so the option text never
+		-- has to be parsed back into a part name. Picking here also moves the
+		-- dummy's highlight, since both write CFG.aim_part through picker_select.
+		-- Default is the 1-based INDEX into Options, the same contract the other
+		-- dropdowns here use. Passing a label string instead left the library's
+		-- display method at nil and the whole menu body died on the first render.
+		aim_info:Dropdown({
+			Name = "Parte do corpo",
+			Options = AIM_PART_LABELS,
+			Default = option_index_by_name(AIM_PART_LABEL, CFG.aim_part),
+			Callback = function(option)
+				-- The callback hands back the option's position, so the label is
+				-- read back from the same list rather than trusted to be a string.
+				local label = AIM_PART_LABELS[option]
+				local part = AIM_PART_BY_LABEL[label]
+				if part ~= nil then
+					CFG.aim_part = part
+					picker_highlight(part)
+				end
+			end,
+		})
+
 		-- Target the enemy's DRONE instead of their body. Drones live in a folder
 		-- in Workspace and carry the pilot's name as an attribute, so "enemy drone"
 		-- means "a drone whose pilot is not on my team" - the same check the
@@ -8570,8 +8799,36 @@ local function build_ui()
 			end,
 		})
 
-		world_info:Header({ Text = "Camera" })
+		-- Brightness. With the fog and the atmosphere off there is no haze left to
+		-- scatter light, and the map goes dark. This raises Lighting.Brightness to
+		-- the chosen value; off restores the number the game had.
+		world_main:Toggle({
+			Name = "Brilho",
+			Default = false,
+			Callback = function(v)
+				CFG.world_bright = v and true or false
+				apply_world()
+			end,
+		})
 
+		world_main:Slider({
+			Name = "Intensidade do brilho",
+			Default = CFG.world_bright_value,
+			Minimum = 1,
+			Maximum = 10,
+			-- One of the library's own display methods. There is no "Default":
+			-- the table is Hundredths / Tenths / Round / Degrees / Percent, and
+			-- anything else leaves ValueDisplayMethod nil and kills the menu body.
+			DisplayMethod = "Round",
+			Callback = function(n)
+				CFG.world_bright_value = n
+				if CFG.world_bright then
+					apply_world()
+				end
+			end,
+		})
+
+		world_info:Header({ Text = "Camera" })
 		world_info:Toggle({
 			Name = "Terceira pessoa",
 			Default = false,
