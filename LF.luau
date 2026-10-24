@@ -8428,54 +8428,15 @@ local function build_ui()
 		Window:SetState(true)
 	end)
 
-	-- Two-tone edge glow, on the sides only.
+	-- The two-tone edge glow used to be built here: two thin Frames pinned to the
+	-- left and right of the window, each a UIGradient from blue to violet.
 	--
-	-- A UIStroke outlines all four edges and there is no per-edge option, so this
-	-- is two thin Frames pinned to the left and right of the window, each with a
-	-- UIGradient fading from one colour to the other. They are parented to the
-	-- window frame, so they move and scale with it, including while dragging.
-	pcall(function()
-		-- The window object the library returns is not an Instance, so the frame
-		-- has to be found in the tree. Every window frame is named "Base"; after
-		-- the boot there is exactly one, because Unload destroyed the previous
-		-- one. Searching the Gui the library just parented into is enough.
-		local root = nil
-		pcall(function()
-			local gui = game:GetService("CoreGui"):FindFirstChild("MacLib")
-			if gui == nil then
-				gui = game:GetService("Players").LocalPlayer
-					:FindFirstChildOfClass("PlayerGui")
-					:FindFirstChild("MacLib")
-			end
-			if gui ~= nil then
-				for _, d in ipairs(gui:GetDescendants()) do
-					if d.Name == "Base" and d:IsA("Frame") then
-						root = d
-						break
-					end
-				end
-			end
-		end)
-		if root ~= nil then
-			local function edge(side, c1, c2)
-				local bar = Instance.new("Frame")
-				bar.Name = "LFAura" .. side
-				bar.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-				bar.BorderSizePixel = 0
-				bar.Size = UDim2.new(0, 2, 1, -24)
-				bar.Position = side == "L" and UDim2.new(0, -1, 0, 12) or UDim2.new(1, -1, 0, 12)
-				bar.ZIndex = 10
-				local grad = Instance.new("UIGradient")
-				grad.Color = ColorSequence.new(c1, c2)
-				grad.Rotation = 90
-				grad.Parent = bar
-				bar.Parent = root
-			end
-			-- Blue at the top fading to violet at the bottom on both sides.
-			edge("L", Color3.fromRGB(90, 170, 255), Color3.fromRGB(170, 110, 255))
-			edge("R", Color3.fromRGB(90, 170, 255), Color3.fromRGB(170, 110, 255))
-		end
-	end)
+	-- apply_theme builds LF_Ring now - one frame wrapped around the whole window,
+	-- whose stroke takes the RGB colour - and that is what "RGB em volta da UI"
+	-- means. Keeping both painted the border twice: the aura bars sat on top of
+	-- the ring with a FIXED blue-violet, so switching RGB on appeared to do
+	-- nothing on the sides. Removed rather than disabled, because two decorations
+	-- for one edge is the kind of thing that comes back as a bug report later.
 
 	local ok_body, err = pcall(function()
 		local Group = Window:TabGroup()
