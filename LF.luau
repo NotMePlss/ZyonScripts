@@ -159,6 +159,7 @@ local E = {
 	-- toggle inert, never throw while the menu is being built.
 	classic = try_enum(function() return Enum.CameraMode.Classic end),
 	thirdperson = try_enum(function() return Enum.CameraMode.ThirdPerson end),
+	custom = try_enum(function() return Enum.CameraType.Custom end),
 }
 
 print("[LF] stage 4: enums resolved")
@@ -181,6 +182,22 @@ local CFG = {
 	esp_visible = false,
 	esp_range = 1200,
 
+	-- Colours. Stored as {r, g, b} 0-255 rather than Color3 so CFG stays plain
+	-- data: Color3 needs the engine, and CFG is read before the ESP starts.
+	esp_color_enemy = { 205, 45, 45 },
+	esp_color_team = { 70, 150, 240 },
+	-- Rainbow over the enemy colour. Speed is cycles per second.
+	esp_rgb = false,
+	esp_rgb_speed = 0.35,
+	-- Bright overlay on every ESP'd player, so they read against a dark map.
+	esp_glow = false,
+	esp_glow_color = { 255, 70, 70 },
+	esp_glow_transparency = 0.55,
+	-- Translucent interior for the full box. Bottom of the stack at 0.7, so the
+	-- target still reads through it instead of turning into a solid card.
+	esp_box_fill = false,
+	esp_box_fill_alpha = 0.78,
+
 	aim_on = true,
 	-- The shipped aim is the one that pulls in game, verbatim except where noted
 	-- in the aim section. Its fov is a RADIUS IN PIXELS around the MOUSE, not
@@ -201,10 +218,36 @@ local CFG = {
 	world_fog = false,       -- push FogEnd out
 	world_atmosphere = false, -- hide Atmosphere instances (haze)
 	world_third = false,     -- third-person camera
-
 	-- Which part the aim pulls to, set by the 3D dummy beside the menu.
 	-- Head by default: it is what the shipped aim used.
 	aim_part = "Head",
+
+	-- Target the enemy DRONES instead of enemy players. The aim resolves its
+	-- target through aim_candidates(), so this only changes which list it walks.
+	aim_drones_only = false,
+
+	--[[ UI tab ]]
+	-- Scale multiplies the whole menu, 0.6 to 1.4. Opacity is the menu's own
+	-- transparency in percent: 100 = solid, 10 = nearly see-through. The floor is
+	-- 10 because below about that the menu stops being readable at all.
+	ui_scale = 1.0,
+	ui_opacity = 100,
+	-- Theme name, one of THEMES below. "Preto com branco" is the library default.
+	ui_theme = "Preto com branco",
+	-- Rainbow only paints the borders, as asked: the body stays dark so the
+	-- rolling hue never fights the text.
+	ui_rgb = false,
+	ui_rgb_speed = 0.25,
+
+	--[[ DRONE tab ]]
+	-- The vision fix is the same ColorCorrection toggle the WORLD tab had; it is
+	-- kept under one name so both tabs drive one state.
+	drone_vision = false,
+	drone_esp = false,
+	drone_esp_dist = true,
+	drone_esp_pilot = true,
+	drone_esp_glow = true,
+	drone_esp_range = 2000,
 }
 -- Publish diagnostics on the executor's global table, whichever exists.
 --
@@ -236,6 +279,11 @@ do
 		env.LF_SHARED = { CFG = CFG, DONE = true }
 	end
 end
+
+-- apply_world is defined much later, once the Lighting objects and the camera
+-- helpers exist. It is hung on LF_SHARED at the end of the UI section so a
+-- reload (and a diagnostic) can re-apply the World switches without having to
+-- drive a Toggle widget through its click handler.
 
 print("[LF] stage 5: config published")
 
@@ -324,6 +372,39 @@ end
 
 local function torso_of(char)
 	return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+end
+
+-- Resolve a player's rig when Player.Character does not hold it. In this place
+-- Character is a stub Model (or nil) while the real body lives under
+-- Workspace.<rig folder>.<player name>, so anything that needs a Humanoid has to
+-- go through here. Returns nil rather than erroring when the player is in the
+-- lobby and has no body at all.
+local RIG_FOLDER_NAMES = {
+	"IIIIllllIIIllIIlIlI_IIllIlIIIllII_o",
+	"IIoooIIl",
+	"lIIooolll",
+}
+
+local function rig_of_char(p)
+	if p == nil then
+		return nil
+	end
+	for _, folder_name in ipairs(RIG_FOLDER_NAMES) do
+		local folder = workspace:FindFirstChild(folder_name)
+		local rig = folder and folder:FindFirstChild(p.Name)
+		if rig ~= nil and rig:FindFirstChildOfClass("Humanoid") ~= nil then
+			return rig
+		end
+	end
+	-- RIG_FOLDER_NAMES is a hint, not the whole truth: the folder hash changes
+	-- between servers. A shallow sweep of Workspace children covers a rename.
+	for _, folder in ipairs(workspace:GetChildren()) do
+		local rig = folder:FindFirstChild(p.Name)
+		if rig ~= nil and rig:FindFirstChildOfClass("Humanoid") ~= nil then
+			return rig
+		end
+	end
+	return nil
 end
 
 -- TeamColor items are compared directly; identity via tostring, because
@@ -629,10 +710,17 @@ local function make_core(p)
 		dist = new_drawing("Text"),
 		snap = nil,
 		lines = nil,
+		box_fill = nil,
 	}
 
-	s.outline.Filled = true
+	-- NOT filled. This was the "FULL box leaves a black interior" bug: a filled
+	-- Square is a solid block, and this one is drawn behind the box at +2 px
+	-- larger in a near-black colour, so every player turned into a black card. It
+	-- is meant as a 1 px dark edge behind the coloured one, which needs an outline,
+	-- not a fill.
+	s.outline.Filled = false
 	s.outline.Color = Color3.fromRGB(0, 0, 0)
+	s.outline.Thickness = 1
 	s.outline.ZIndex = 2
 
 	s.box.Filled = false
@@ -717,7 +805,19 @@ end
 local alloc = {
 	snap = nil,
 	lines = nil,
+	box_fill = nil,
 }
+
+local function make_box_fill(s)
+	if s.box_fill then
+		return s.box_fill
+	end
+	local d = new_drawing("Square")
+	d.Filled = true
+	d.ZIndex = 2
+	s.box_fill = d
+	return d
+end
 
 local function queue_alloc(kind)
 	if alloc[kind] ~= nil then
@@ -728,6 +828,8 @@ local function queue_alloc(kind)
 		if kind == "snap" and s.snap == nil then
 			list[#list + 1] = p
 		elseif kind == "lines" and s.lines == nil then
+			list[#list + 1] = p
+		elseif kind == "box_fill" and s.box_fill == nil then
 			list[#list + 1] = p
 		end
 	end
@@ -740,7 +842,7 @@ end
 -- A player can leave between being queued and being served, so state[p] is
 -- checked before use and the entry is dropped rather than retried forever.
 local function service_alloc()
-	for _, kind in ipairs({ "snap", "lines" }) do
+	for _, kind in ipairs({ "snap", "lines", "box_fill" }) do
 		local list = alloc[kind]
 		if list ~= nil and #list > 0 then
 			local p = table.remove(list)
@@ -748,8 +850,10 @@ local function service_alloc()
 			if s then
 				if kind == "snap" then
 					pcall(make_snap, s)
-				else
+				elseif kind == "lines" then
 					pcall(make_lines, s)
+				else
+					pcall(make_box_fill, s)
 				end
 			end
 			if #list == 0 then
@@ -770,7 +874,26 @@ local early_conns = {}
 early_conns[#early_conns + 1] = Players.PlayerRemoving:Connect(function(p)
 	local s = state[p]
 	if s then
-		local singles = { s.outline, s.box, s.name, s.tag, s.hp_bg, s.hp_fill, s.hp_edge, s.dist }
+		-- The glow is a real Highlight instance parented to their character. If it
+		-- is not destroyed here it outlives the slot and keeps glowing a player who
+		-- already left, which is also a leak of one instance per departure.
+		pcall(function()
+			if s.hl ~= nil and s.hl.Parent ~= nil then
+				s.hl:Destroy()
+			end
+		end)
+		s.hl = nil
+		-- box_fill is created lazily, so it is usually nil. Putting it inline in a
+		-- table literal is what leaked every name/tag/health/distance drawing: a
+		-- nil in the middle truncates the array, so ipairs stopped there and the
+		-- rest of the slot was never removed. Named keys, then an explicit skip.
+		local singles = {
+			s.outline, s.box, s.name, s.tag,
+			s.hp_bg, s.hp_fill, s.hp_edge, s.dist,
+		}
+		if s.box_fill ~= nil then
+			singles[#singles + 1] = s.box_fill
+		end
 		for _, obj in ipairs(singles) do
 			pcall(function() obj:Remove() end)
 		end
@@ -839,6 +962,10 @@ local function hide(s)
 	s.hp_fill.Visible = false
 	s.hp_edge.Visible = false
 	s.dist.Visible = false
+	-- Lazily built by the box-fill option, so usually nil.
+	if s.box_fill then
+		s.box_fill.Visible = false
+	end
 	-- snap and lines are created lazily, so both can still be nil here
 	if s.snap then
 		for _, l in pairs(s.snap) do
@@ -1071,6 +1198,12 @@ local function draw_player(p, my_pos)
 	if not pos then
 		if s then
 			hide(s)
+			-- The glow is an instance on the character, not a Drawing, so hiding
+			-- the slot does not touch it. It has to be turned off here or a player
+			-- who walks out of range keeps glowing at the last place they were.
+			if s.hl ~= nil and s.hl.Parent ~= nil then
+				pcall(function() s.hl.Enabled = false end)
+			end
 		end
 		return
 	end
@@ -1084,15 +1217,67 @@ local function draw_player(p, my_pos)
 	end
 
 	local friendly = CFG.esp_team and ally_cached(p)
-	local col = Color3.fromRGB(205, 45, 45)
+	-- Enemy colour is configurable; the friendly blue stays fixed so the two can
+	-- never collapse into the same colour and make a teammate look hostile.
+	local e = CFG.esp_color_enemy
+	local col = Color3.fromRGB(e[1], e[2], e[3])
 	if friendly then
-		col = Color3.fromRGB(70, 150, 240)
+		local f = CFG.esp_color_team
+		col = Color3.fromRGB(f[1], f[2], f[3])
+	end
+	-- Rainbow cycles the enemy colour. Applied after the branch above so it also
+	-- overrides the fixed enemy colour, but never the teammate blue.
+	if CFG.esp_rgb and not friendly then
+		col = Color3.fromHSV((os.clock() * CFG.esp_rgb_speed) % 1, 1, 1)
+	end
+
+	-- Glow: a Highlight on the character. Client-side only - a Highlight created
+	-- locally is not replicated and does not touch the character's appearance on
+	-- the server, which is why this one is safe to add where a client-side BodyGlow
+	-- or a material change would not be. Created lazily, once per slot, and reused;
+	-- the same instance follows the player across respawns because it is parented
+	-- to whatever character they have right now.
+	if CFG.esp_glow then
+		if s.hl == nil or s.hl.Parent ~= char then
+			pcall(function()
+				if s.hl ~= nil then
+					s.hl:Destroy()
+				end
+				local hl = Instance.new("Highlight")
+				hl.Name = "LF_Glow"
+				hl.FillColor = Color3.fromRGB(
+					CFG.esp_glow_color[1], CFG.esp_glow_color[2], CFG.esp_glow_color[3])
+				hl.OutlineColor = col
+				hl.FillTransparency = CFG.esp_glow_transparency
+				hl.OutlineTransparency = 0.15
+				-- Best-effort: an executor whose Enum table lacks HighlightDepthMode
+				-- would throw here, and the glow is still worth having without it.
+				pcall(function()
+					hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				end)
+				hl.Parent = char
+				s.hl = hl
+			end)
+		end
+		if s.hl ~= nil and s.hl.Parent ~= nil then
+			pcall(function()
+				s.hl.Enabled = true
+				-- The fill stays put; only the rim follows the ESP colour, so a
+				-- rainbow enemy glows in the same hue as their box.
+				s.hl.OutlineColor = col
+			end)
+		end
+	elseif s.hl ~= nil and s.hl.Parent ~= nil then
+		pcall(function() s.hl.Enabled = false end)
 	end
 
 	-- Box styles: 1 = full box, 2 = corner braces. Only one is drawn at a time;
 	-- leaving the other set visible from a previous frame is how you get a box
 	-- and braces stacked on top of each other after a toggle.
 	if CFG.esp_box and CFG.esp_box_style == 1 then
+		-- Full box. The dark edge behind it is an OUTLINE, 1 px, offset by -1.
+		-- Its colour used to be near-black AND filled; disabling the fill is the
+		-- fix for the "FULL leaves the box interior black" report.
 		s.outline.Visible = true
 		s.outline.Position = Vector2.new(pos.X - 1, pos.Y - 1)
 		s.outline.Size = Vector2.new(size.X + 2, size.Y + 2)
@@ -1101,6 +1286,27 @@ local function draw_player(p, my_pos)
 		s.box.Position = pos
 		s.box.Size = size
 		s.box.Color = col
+
+		-- Translucent interior, drawn BETWEEN the dark edge and the coloured
+		-- border so the outline still reads. This is a separate drawing on
+		-- purpose: reusing s.outline for a fill is what produced the black box,
+		-- because that square is also the 1 px shadow behind every style.
+		if CFG.esp_box_fill then
+			if s.box_fill == nil then
+				queue_alloc("box_fill")
+				s.box_fill = nil
+			end
+			if s.box_fill ~= nil then
+				s.box_fill.Visible = true
+				s.box_fill.Filled = true
+				s.box_fill.Color = col
+				s.box_fill.Transparency = CFG.esp_box_fill_alpha
+				s.box_fill.Position = pos
+				s.box_fill.Size = size
+			end
+		elseif s.box_fill ~= nil then
+			s.box_fill.Visible = false
+		end
 	else
 		s.outline.Visible = false
 		s.box.Visible = false
@@ -1185,6 +1391,272 @@ local function draw_player(p, my_pos)
 end
 
 print("[LF] stage 7: esp ready")
+
+--[[ drones ]]
+--
+-- Measured in game rather than guessed: a drone is NOT a part on the pilot's
+-- character and not in the player rig folder. It is a Model inside
+-- workspace["IllllII_iiii"], carrying two attributes that are all the ESP needs:
+--
+--   :GetAttribute("player")   the PILOT's name
+--   :GetAttribute("throttle") "1" / "2" while flying
+--
+-- Dead drones stay in the folder with no children and no PrimaryPart, so every
+-- candidate is checked for a real body before it is drawn or aimed at - otherwise
+-- the ESP happily draws a box at (0, 0, 0) for a drone that no longer exists.
+local DRONE_FOLDER_NAMES = { "IllllII_iiii" }
+
+local function drone_folder()
+	-- Resolved through the service, not the `workspace` global: an executor can
+	-- install this file into an environment where that global is absent, and the
+	-- drone pass runs inside a pcall per frame - so the failure was silent apart
+	-- from a warning, and every drone went undrawn.
+	local ws = WS
+	if ws == nil then
+		-- WS is resolved once at the top of the file. Under an executor that does
+		-- not expose GetService at load time it can be nil, so it is retried here
+		-- rather than crashing the whole drone pass every frame.
+		local ok, svc = pcall(function()
+			return game:GetService("Workspace")
+		end)
+		ws = ok and svc or nil
+	end
+	if ws == nil then
+		return nil
+	end
+	-- Guard the shape, not just the nil: WS is whatever the environment calls the
+	-- workspace, and asking it for children when it is not a container must degrade
+	-- to "no drones" rather than throwing once per frame.
+	if type(ws.FindFirstChild) ~= "function" then
+		return nil
+	end
+	for _, name in ipairs(DRONE_FOLDER_NAMES) do
+		local f = ws:FindFirstChild(name)
+		if f ~= nil then
+			return f
+		end
+	end
+	-- the folder name is a hash and can change between servers
+	for _, d in ipairs(ws:GetChildren()) do
+		if d:IsA("Folder") or d:IsA("Model") then
+			local child = d:GetChildren()
+			if #child > 0 then
+				for _, c in ipairs(child) do
+					if c:IsA("Model") and c:GetAttribute("player") ~= nil then
+						return d
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function drone_body(model)
+	if model == nil then
+		return nil
+	end
+	local pp = model.PrimaryPart
+	if pp ~= nil then
+		return pp
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			return d
+		end
+	end
+	return nil
+end
+
+-- Every live drone: { model, pilot, part, pos }.
+local function live_drones()
+	local list = {}
+	local folder = drone_folder()
+	if folder == nil then
+		return list
+	end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") then
+			local part = drone_body(model)
+			if part ~= nil then
+				list[#list + 1] = {
+					model = model,
+					pilot = model:GetAttribute("player"),
+					part = part,
+					pos = part.Position,
+				}
+			end
+		end
+	end
+	return list
+end
+
+-- A drone is an enemy when its pilot is not on our side. Reuses ally_cached, so
+-- there is one definition of "teammate" in the whole file.
+local function drone_is_enemy(pilot)
+	if pilot == nil then
+		return false
+	end
+	local p = Players:FindFirstChild(tostring(pilot))
+	if p == nil then
+		-- A pilot who already left: their drone still exists for a moment. Treat it
+		-- as an enemy so the ESP does not blink it out mid-despawn.
+		return true
+	end
+	return not ally_cached(p)
+end
+
+-- One Drawing set per drone, keyed by the Model. Separate from the player slots
+-- because drones come and go far more often and must not consume the player
+-- alloc queues.
+local drone_draw = {}
+
+local function drone_slot(model)
+	local s = drone_draw[model]
+	if s ~= nil then
+		return s
+	end
+	s = {
+		box = new_drawing("Square"),
+		outline = new_drawing("Square"),
+		label = new_drawing("Text"),
+		dist = new_drawing("Text"),
+	}
+	s.outline.Filled = false
+	s.outline.Color = Color3.fromRGB(0, 0, 0)
+	s.outline.Thickness = 1
+	s.outline.ZIndex = 2
+	s.box.Filled = false
+	s.box.Thickness = 2
+	s.box.ZIndex = 3
+	s.label.Size = 13
+	s.label.Center = true
+	s.label.Outline = true
+	s.label.OutlineColor = Color3.fromRGB(0, 0, 0)
+	s.label.ZIndex = 5
+	s.dist.Size = 12
+	s.dist.Center = true
+	s.dist.Outline = true
+	s.dist.OutlineColor = Color3.fromRGB(0, 0, 0)
+	s.dist.ZIndex = 5
+	drone_draw[model] = s
+	return s
+end
+
+local function drone_hide(s)
+	if s == nil then
+		return
+	end
+	pcall(function()
+		s.box.Visible = false
+		s.outline.Visible = false
+		s.label.Visible = false
+		s.dist.Visible = false
+	end)
+end
+
+-- Glow for a drone: a Highlight on the Model, client-side only, same as the
+-- player glow. Kept on the model so it dies with it.
+local function drone_glow(model, on, colour)
+	local hl = model:FindFirstChild("LF_DroneGlow")
+	if on then
+		if hl == nil then
+			pcall(function()
+				hl = Instance.new("Highlight")
+				hl.Name = "LF_DroneGlow"
+				hl.FillColor = colour
+				hl.FillTransparency = 0.55
+				hl.OutlineColor = colour
+				hl.OutlineTransparency = 0.1
+				-- Best-effort: an executor whose Enum table lacks HighlightDepthMode
+				-- would throw here, and the glow is still worth having without it.
+				pcall(function()
+					hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				end)
+				hl.Parent = model
+			end)
+		end
+		if hl ~= nil then
+			pcall(function()
+				hl.Enabled = true
+				hl.FillColor = colour
+				hl.OutlineColor = colour
+			end)
+		end
+	elseif hl ~= nil then
+		pcall(function() hl.Enabled = false end)
+	end
+end
+
+-- Drone ESP, drawn from the frame loop right after the player ESP.
+local function draw_drones(c, my_pos)
+	local seen = {}
+	for _, d in ipairs(live_drones()) do
+		seen[d.model] = true
+		if CFG.drone_esp then
+			local dist = (d.pos - my_pos).Magnitude
+			if dist <= CFG.drone_esp_range then
+				local screen, onScreen = c:WorldToViewportPoint(d.pos)
+				if onScreen then
+					local s = drone_slot(d.model)
+					local enemy = drone_is_enemy(d.pilot)
+					local col = enemy and rgb3(CFG.esp_color_enemy) or rgb3(CFG.esp_color_team)
+					-- Drones are small: give the box a fixed floor so it stays visible
+					-- at range instead of collapsing to a couple of pixels.
+					local h = math.clamp(2400 / math.max(dist, 1), 18, 90)
+					local w = h * 0.9
+					local pos = Vector2.new(screen.X - w * 0.5, screen.Y - h * 0.5)
+
+					s.outline.Visible = true
+					s.outline.Position = Vector2.new(pos.X - 1, pos.Y - 1)
+					s.outline.Size = Vector2.new(w + 2, h + 2)
+					s.box.Visible = true
+					s.box.Position = pos
+					s.box.Size = Vector2.new(w, h)
+					s.box.Color = col
+
+					local y = pos.Y - 16
+					if CFG.drone_esp_pilot and d.pilot ~= nil then
+						s.label.Visible = true
+						s.label.Text = tostring(d.pilot)
+						s.label.Color = col
+						s.label.Position = Vector2.new(screen.X, y)
+					else
+						s.label.Visible = false
+					end
+
+					if CFG.drone_esp_dist then
+						s.dist.Visible = true
+						s.dist.Text = tostring(math.floor(dist)) .. "m"
+						s.dist.Color = Color3.fromRGB(215, 215, 215)
+						s.dist.Position = Vector2.new(screen.X, pos.Y + h + 2)
+					else
+						s.dist.Visible = false
+					end
+
+					drone_glow(d.model, CFG.drone_esp_glow, col)
+				else
+					drone_hide(drone_draw[d.model])
+				end
+			else
+				drone_hide(drone_draw[d.model])
+			end
+		else
+			drone_hide(drone_draw[d.model])
+		end
+	end
+	-- drones that vanished: free their drawings
+	for model, s in pairs(drone_draw) do
+		if not seen[model] then
+			drone_hide(s)
+			for _, obj in ipairs({ s.box, s.outline, s.label, s.dist }) do
+				pcall(function() obj:Remove() end)
+			end
+			drone_draw[model] = nil
+		end
+	end
+end
+
 
 --[[ aim ]]
 --
@@ -1308,6 +1780,29 @@ local function start_aim()
 				ignored[2] = character
 				rayParams.FilterDescendantsInstances = ignored
 
+				-- Drone mode. Same pull, same raycast, same everything - only the
+				-- list of things it is allowed to pick from changes, which is why
+				-- the aim maths below is untouched.
+				if CFG.aim_drones_only then
+					for _, d in ipairs(live_drones()) do
+						if drone_is_enemy(d.pilot) then
+							local screen, onScreen = camera:WorldToViewportPoint(d.pos)
+							local dx, dy = screen.X - mouse.X, screen.Y - mouse.Y
+							local distance = dx * dx + dy * dy
+							local take = onScreen and distance < bestDistance
+							if take then
+								local hit = WS:Raycast(origin, d.pos - origin, rayParams)
+								if hit and not hit.Instance:IsDescendantOf(d.model) then
+									take = false
+								end
+							end
+							if take then
+								bestX, bestY, bestDistance = dx, dy, distance
+								aim_state.target = d.model
+							end
+						end
+					end
+				else
 				for _, player in ipairs(Players:GetPlayers()) do
 					if player ~= LP then
 						local target = player.Character
@@ -1356,6 +1851,7 @@ local function start_aim()
 							end
 						end
 					end
+				end
 				end
 
 				if bestX then
@@ -5308,12 +5804,21 @@ end
 					local slider = value
 					local colour = color
 
+					-- hex/red/green/blue/alpha are Frames; the editable box is their
+					-- child TextBox named "InputBox". The vendored library indexed it as
+					-- a field (`hex.InputBox`), which is nil in the real engine - Frame
+					-- has no such member - so the Colorpicker threw at the first
+					-- modifierInputs use and took the entire menu body down with it.
+					local function input_box(frame)
+						return frame:FindFirstChild("InputBox")
+					end
+
 					local modifierInputs = {
-						Hex = hex.InputBox,
-						Red = red.InputBox,
-						Green = green.InputBox,
-						Blue = blue.InputBox,
-						Alpha = alpha.InputBox
+						Hex = input_box(hex),
+						Red = input_box(red),
+						Green = input_box(green),
+						Blue = input_box(blue),
+						Alpha = input_box(alpha)
 					}
 
 					local Mouse = LocalPlayer:GetMouse()
@@ -6867,6 +7372,19 @@ local BOX_STYLES = { 1, 2 }
 local BOX_STYLE_NAMES = { "full", "corner" }
 local RANGES = { 400, 800, 1200, 2000 }
 local FOVS = { 150, 250, 400 }
+-- Drones fly far higher and further than a body, so their ESP gets its own list.
+local DRONE_RANGES = { 500, 1000, 2000, 4000 }
+
+-- 1-based index of a STRING option in a dropdown list. The themes are picked by
+-- name, not by number, so option_index (which compares numbers) cannot serve them.
+local function option_index_by_name(list, value)
+	for i, k in ipairs(list) do
+		if k == value then
+			return i
+		end
+	end
+	return 1
+end
 
 -- label to show for a cycle value, so the dropdown shows "corner" and not "2"
 local function name_of(keys, names, value)
@@ -6914,6 +7432,13 @@ local WORLD = {
 	fog_saved = nil,    -- original FogEnd
 	atmos = nil,        -- { {inst = ..., visible = ...}, ... }
 	third_saved = nil,  -- original CameraMode
+	-- The game runs CameraType = Scriptable with no subject; forcing ThirdPerson
+	-- needs the camera handed back to the player, so the original CameraType is
+	-- captured here and put back on toggle off.
+	cam_saved = nil,
+	-- Player.CameraMaxZoomDistance as the game had it, so third person off puts
+	-- the zoom range back instead of leaving it wide.
+	zoom_saved = nil,
 }
 
 local function get_lighting()
@@ -7009,16 +7534,86 @@ local function apply_world()
 		end
 	end
 
+	-- Third person, measured against the real enum rather than assumed.
+	--
+	-- The first version wrote `lp.CameraMode = Enum.CameraMode.ThirdPerson`, which
+	-- CANNOT work here: this build's CameraMode enum has exactly two members,
+	-- Classic (0) and LockFirstPerson (1). There is no ThirdPerson, try_enum
+	-- returned nil, and `lp.CameraMode = nil` fails without an error anyone sees -
+	-- which is why the toggle moved nothing no matter how it was clicked.
+	--
+	-- Classic IS third person; LockFirstPerson is the one that pins the camera to
+	-- the head. So "third person" here means: leave CameraMode on Classic, give the
+	-- camera a subject to orbit, and open up the zoom range so the view can pull
+	-- back. The first-person mode is what gets forced off.
 	pcall(function()
 		local players = game:GetService("Players")
 		local lp = players.LocalPlayer
 		if lp == nil then
 			return
 		end
-		if CFG.world_third then
-			lp.CameraMode = E.thirdperson
+		local camera = workspace.CurrentCamera
+		local third = CFG.world_third and true or false
+
+		if third then
+			-- capture the originals exactly once, so "off" restores the game's own
+			-- values instead of whatever this script happened to leave behind
+			if WORLD.zoom_saved == nil then
+				local ok, v = pcall(function()
+					return lp.CameraMaxZoomDistance
+				end)
+				WORLD.zoom_saved = ok and v or nil
+			end
+			pcall(function()
+				lp.CameraMaxZoomDistance = 32
+			end)
 		else
-			lp.CameraMode = E.classic
+			if WORLD.zoom_saved ~= nil and WORLD.zoom_saved ~= false then
+				pcall(function()
+					lp.CameraMaxZoomDistance = WORLD.zoom_saved
+				end)
+				WORLD.zoom_saved = nil
+			end
+		end
+
+		-- CameraMode: only ever set to a member that exists in this build.
+		local want_mode = third and E.classic or nil
+		if want_mode ~= nil then
+			pcall(function()
+				lp.CameraMode = want_mode
+			end)
+		end
+
+		-- The subject and the type only when there is a character to orbit. In the
+		-- lobby there is none, so the zoom range above is the whole effect - which
+		-- is honest: there is nothing to put in third person yet.
+		local char = lp.Character
+		if char == nil or char:FindFirstChildOfClass("Humanoid") == nil then
+			char = rig_of_char(lp) or char
+		end
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum == nil or camera == nil then
+			return
+		end
+		if third then
+			pcall(function()
+				if WORLD.cam_saved == nil then
+					WORLD.cam_saved = camera.CameraType
+				end
+			end)
+			pcall(function()
+				camera.CameraSubject = hum
+			end)
+			pcall(function()
+				camera.CameraType = E.custom
+			end)
+		else
+			if WORLD.cam_saved ~= nil then
+				pcall(function()
+					camera.CameraType = WORLD.cam_saved
+				end)
+				WORLD.cam_saved = nil
+			end
 		end
 	end)
 end
@@ -7128,9 +7723,17 @@ local function build_picker()
 			playerGui = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
 		end)
 		local parent = nil
+		-- Same order as the menu itself: the executor's hidden container first,
+		-- because that is where MacLib ends up and the dummy has to sit beside
+		-- it at the same depth. CoreGui next, PlayerGui last.
 		pcall(function()
-			parent = game:GetService("CoreGui")
+			parent = gethui and gethui()
 		end)
+		if parent == nil then
+			pcall(function()
+				parent = game:GetService("CoreGui")
+			end)
+		end
 		if parent == nil then
 			parent = playerGui
 		end
@@ -7285,6 +7888,15 @@ local function build_picker()
 	return PICKER.gui
 end
 
+--[[ theming ]]
+
+-- Cached menu root and the theme bookkeeping. Declared before anything that
+-- reads it so the first frame never indexes nil.
+local MENU = {
+	root = nil,
+	applied = false,
+}
+
 -- True when the AIM tab is the one on screen. Read from the tree, not from a
 -- flag: the library moves the selected tab's sections into "Content", so the
 -- presence of the AIM-only header under Content IS the answer.
@@ -7304,6 +7916,202 @@ local function aim_tab_showing()
 		return false
 	end)
 	return ok and found
+end
+
+-- The menu is built by the vendored library, which paints its own colours inline
+-- and exposes no theme hook. Rather than fork every colour into the library, the
+-- finished tree is recoloured here: the widgets that matter are found by their
+-- names and their current colour, and only those are touched.
+--
+-- Every theme keeps the body dark and changes the accent. "Branco" is the one
+-- inversion (light body), and it recolours text to near-black so it stays legible.
+local THEMES = {
+	["Preto com branco"] = { body = { 15, 15, 15 }, accent = { 255, 255, 255 }, light = false },
+	["Vermelho"] = { body = { 24, 12, 12 }, accent = { 220, 55, 55 }, light = false },
+	["Verde"] = { body = { 10, 22, 12 }, accent = { 70, 200, 110 }, light = false },
+	["Azul"] = { body = { 10, 16, 28 }, accent = { 70, 140, 245 }, light = false },
+	["Branco"] = { body = { 235, 235, 238 }, accent = { 30, 30, 34 }, light = true },
+	["Amarelo"] = { body = { 24, 21, 8 }, accent = { 240, 205, 60 }, light = false },
+}
+
+local THEME_NAMES = {
+	"Preto com branco", "Vermelho", "Verde", "Azul", "Branco", "Amarelo",
+}
+
+local function theme_of(name)
+	return THEMES[name] or THEMES["Preto com branco"]
+end
+
+local function rgb3(t)
+	return Color3.fromRGB(t[1], t[2], t[3])
+end
+
+-- Rainbow accent, used only when ui_rgb is on. It cycles the accent, which is
+-- what paints borders and toggles; the body is left alone.
+local function accent_now()
+	if CFG.ui_rgb then
+		return Color3.fromHSV((os.clock() * CFG.ui_rgb_speed) % 1, 0.85, 1)
+	end
+	return rgb3(theme_of(CFG.ui_theme).accent)
+end
+
+-- The menu's root. Located the same way everything else locates it, and cached
+-- because the apply pass runs on every theme change and every frame while RGB is on.
+local function menu_root()
+	if MENU.root ~= nil and MENU.root.Parent ~= nil then
+		return MENU.root
+	end
+	local found = nil
+	local function scan(container)
+		if found ~= nil or container == nil then
+			return
+		end
+		local gui = container:FindFirstChild("MacLib")
+		if gui ~= nil then
+			found = gui:FindFirstChild("Base") or gui
+		end
+	end
+	pcall(function() scan(gethui and gethui()) end)
+	if found == nil then
+		pcall(function() scan(game:GetService("CoreGui")) end)
+	end
+	if found == nil then
+		pcall(function()
+			scan(game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui"))
+		end)
+	end
+	MENU.root = found
+	return found
+end
+
+-- Apply the current theme, scale and opacity to the live menu. Safe to call at
+-- any time: missing nodes are skipped rather than fatal, so a library update that
+-- renames something costs that one element's colour, not the menu.
+local function apply_theme()
+	local root = menu_root()
+	if root == nil then
+		return
+	end
+	local theme = theme_of(CFG.ui_theme)
+	local accent = accent_now()
+	local body = rgb3(theme.body)
+	local text_col = theme.light and Color3.fromRGB(25, 25, 28) or Color3.fromRGB(255, 255, 255)
+
+	-- Opacity: 100 leaves it solid, 10 is the floor. The library's own base sits at
+	-- 0.25 transparency by default, so this is expressed as "how solid", applied on
+	-- top of nothing else - the number the user sets is the number they get.
+	local alpha = math.clamp((CFG.ui_opacity or 100) / 100, 0.10, 1)
+	local base_transparency = 1 - alpha
+
+	pcall(function()
+		-- menu_root() already resolves to Base when it can; only look for a nested
+		-- Base when it handed back the MacLib ScreenGui itself. Reading
+		-- root:FindFirstChild("Base") unconditionally meant Base was nil on the
+		-- normal path, the whole block was skipped, and scale/opacity/themes never
+		-- applied even though the RGB accent pass right after it did.
+		local base = root
+		if base.Name ~= "Base" then
+			base = root:FindFirstChild("Base") or base
+		end
+		if base ~= nil then
+			base.BackgroundColor3 = body
+			base.BackgroundTransparency = base_transparency
+			-- Scale. The library sizes Base from the window settings in pixels, so
+			-- the multiplier is folded into a UIScale child instead of recomputing
+			-- the size - a UIScale scales everything, including text, which is what
+			-- "escala da UI" means.
+			local scale = base:FindFirstChild("LF_Scale")
+			if scale == nil then
+				scale = Instance.new("UIScale")
+				scale.Name = "LF_Scale"
+				scale.Parent = base
+			end
+			scale.Scale = math.clamp(CFG.ui_scale or 1, 0.6, 1.4)
+
+			-- The library paints the window with a nameless Frame that covers ~97%
+			-- of Base at near-full opacity and opaque black. Colouring Base alone
+			-- therefore changed nothing visible: the body stayed black while the
+			-- accent pass (which runs below) did change, which is exactly the
+			-- "bordas mudam, fundo nao" symptom. Any child that covers the window
+			-- and is opaque is treated as the body and takes the theme colour.
+			for _, child in ipairs(base:GetChildren()) do
+				if child:IsA("Frame") and child.BackgroundTransparency < 0.5 then
+					local sx = child.Size.X.Scale
+					local sy = child.Size.Y.Scale
+					if sx > 0.9 and sy > 0.9 then
+						child.BackgroundColor3 = body
+						child.BackgroundTransparency = base_transparency
+					end
+				end
+			end
+		end
+	end)
+
+	-- Accent pass: strokes, toggles, sliders, the selected tab underline and the
+	-- window controls all carry the accent. Matched by name, which is stable
+	-- across the library version this file vendors.
+	pcall(function()
+		for _, d in ipairs(root:GetDescendants()) do
+			local n = d.Name
+			if n == "UIStroke" or n:find("UIStroke") then
+				if d:IsA("UIStroke") then
+					d.Color = accent
+				end
+			elseif n == "TogglerHead" then
+				if d:IsA("ImageLabel") or d:IsA("Frame") then
+					d.ImageColor3 = accent
+				end
+			elseif n == "Toggle" and d:IsA("ImageButton") then
+				-- The track stays dark; only the lit state carries the accent and the
+				-- library tweens that itself, so it is left alone here.
+			elseif n == "SliderFill" or n == "Fill" then
+				if d:IsA("Frame") then
+					d.BackgroundColor3 = accent
+				end
+			elseif n == "TabSwitcherUIStroke" then
+				if d:IsA("UIStroke") then
+					d.Color = accent
+				end
+			elseif n == "Sidebar" or n == "TabSwitcher" or n == "ElementsScrolling"
+				or n == "Content" or n == "Topbar" or n == "Elements" or n == "Information"
+				or n == "WindowControls" or n == "SidebarGroup" then
+				-- These are the surfaces the user actually looks at. Content, Topbar
+				-- and Elements were missing from this list, which is why the theme
+				-- changed the accent but left the window black: the three biggest
+				-- painted areas were never recoloured.
+				if d:IsA("Frame") then
+					d.BackgroundColor3 = theme.light and Color3.fromRGB(215, 215, 220) or body
+				end
+			elseif n == "HeaderText" or n == "LabelText" or n == "SubLabelText"
+				or n == "ParagraphHeader" or n == "ParagraphBody" or n == "TabSwitcherName"
+				or n == "ToggleName" or n == "SliderName" or n == "DropdownName"
+				or n == "ButtonName" or n == "InputName" or n == "KeybindName"
+				or n == "SectionName" or n == "ColorpickerName" then
+				if d:IsA("TextLabel") then
+					d.TextColor3 = text_col
+				end
+			end
+		end
+	end)
+
+	-- The aura bars are separate frames this file owns, parented to Base. They
+	-- read the accent so the glow is always the theme colour.
+	pcall(function()
+		local base = root:FindFirstChild("Base")
+		if base == nil then
+			return
+		end
+		for _, nome in ipairs({ "LFAuraL", "LFAuraR" }) do
+			local bar = base:FindFirstChild(nome)
+			if bar ~= nil then
+				bar.Visible = true
+				local grad = bar:FindFirstChildOfClass("UIGradient")
+				if grad ~= nil then
+					grad.Color = ColorSequence.new(accent, Color3.fromRGB(170, 110, 255))
+				end
+			end
+		end
+	end)
 end
 
 -- Called from the tab switcher below: the panel exists only on the AIM tab.
@@ -7441,6 +8249,11 @@ local function build_ui()
 		local EspTab = Group:Tab({ Name = "ESP" })
 		local esp_main = EspTab:Section({ Side = "Left" })
 		local esp_more = EspTab:Section({ Side = "Right" })
+		-- Colours and glow get their own sections: the ESP tab already fills both
+		-- columns, and stacking colourpickers into "Filtros" reads as if they
+		-- filtered something.
+		local esp_colors = EspTab:Section({ Side = "Left" })
+		local espl_glow = EspTab:Section({ Side = "Right" })
 
 		esp_main:Header({ Text = "ESP" })
 
@@ -7557,6 +8370,90 @@ local function build_ui()
 			end,
 		})
 
+		-- Colours. MacLib's Colorpicker writes R, G and B as 0-1 floats and the
+		-- callback receives a Color3, so CFG keeps plain 0-255 bytes and converts.
+		esp_colors:Header({ Text = "Cores" })
+
+		esp_colors:Colorpicker({
+			Name = "Inimigo",
+			Default = rgb3(CFG.esp_color_enemy),
+			Callback = function(_, c)
+				if typeof(c) == "Color3" then
+					CFG.esp_color_enemy = { math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255) }
+				end
+			end,
+		})
+
+		esp_colors:Colorpicker({
+			Name = "Time",
+			Default = rgb3(CFG.esp_color_team),
+			Callback = function(_, c)
+				if typeof(c) == "Color3" then
+					CFG.esp_color_team = { math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255) }
+				end
+			end,
+		})
+
+		esp_colors:Toggle({
+			Name = "RGB",
+			Default = CFG.esp_rgb,
+			Callback = function(v)
+				CFG.esp_rgb = v and true or false
+			end,
+		})
+
+		esp_colors:Slider({
+			Name = "Velocidade RGB",
+			Default = math.floor(CFG.esp_rgb_speed * 100 + 0.5),
+			Minimum = 5,
+			Maximum = 200,
+			DisplayMethod = "Percent",
+			Callback = function(v)
+				local n = tonumber(v)
+				if n == nil or n ~= n then
+					return
+				end
+				CFG.esp_rgb_speed = math.clamp(n / 100, 0.05, 2)
+			end,
+		})
+
+		espl_glow:Header({ Text = "Glowing" })
+
+		espl_glow:Toggle({
+			Name = "Enabled",
+			Default = CFG.esp_glow,
+			Callback = function(v)
+				CFG.esp_glow = v and true or false
+			end,
+		})
+
+		espl_glow:Colorpicker({
+			Name = "Cor do glow",
+			Default = rgb3(CFG.esp_glow_color),
+			Callback = function(_, c)
+				if typeof(c) == "Color3" then
+					CFG.esp_glow_color = { math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255) }
+				end
+			end,
+		})
+
+		espl_glow:Slider({
+			Name = "Intensidade",
+			Default = math.floor((1 - CFG.esp_glow_transparency) * 100 + 0.5),
+			Minimum = 5,
+			Maximum = 90,
+			DisplayMethod = "Percent",
+			Callback = function(v)
+				local n = tonumber(v)
+				if n == nil or n ~= n then
+					return
+				end
+				-- Stored as transparency, which is how Highlight wants it. The
+				-- slider speaks intensity because "more" should read as more.
+				CFG.esp_glow_transparency = math.clamp(1 - (n / 100), 0.1, 0.95)
+			end,
+		})
+
 		-- ============================================================= AIM
 		local AimTab = Group:Tab({ Name = "AIM" })
 		local aim_main = AimTab:Section({ Side = "Left" })
@@ -7622,8 +8519,18 @@ local function build_ui()
 		-- and the hold button in two paragraphs, which the widget labels now say
 		-- in one line each.
 		aim_info:Header({ Text = "Alvo" })
-		aim_info:Label({ Text = "Puxe o alvo pelo boneco ao lado do menu." })
-		aim_info:Label({ Text = "O boneco so aparece na aba AIM." })
+
+		-- Target the enemy's DRONE instead of their body. Drones live in a folder
+		-- in Workspace and carry the pilot's name as an attribute, so "enemy drone"
+		-- means "a drone whose pilot is not on my team" - the same check the
+		-- player ESP already uses.
+		aim_info:Toggle({
+			Name = "So drones inimigos",
+			Default = CFG.aim_drones_only,
+			Callback = function(v)
+				CFG.aim_drones_only = v and true or false
+			end,
+		})
 
 		-- ============================================================ WORLD
 		local WorldTab = Group:Tab({ Name = "WORLD" })
@@ -7674,7 +8581,157 @@ local function build_ui()
 			end,
 		})
 
-		world_info:Label({ Text = "Desligado, tudo volta ao original." })
+
+		-- =============================================================== UI
+		local UiTab = Group:Tab({ Name = "UI" })
+		local ui_main = UiTab:Section({ Side = "Left" })
+		local ui_colors = UiTab:Section({ Side = "Right" })
+
+		ui_main:Header({ Text = "Menu" })
+
+		ui_main:Slider({
+			Name = "Escala",
+			Default = CFG.ui_scale,
+			Minimum = 60,
+			Maximum = 140,
+			DisplayMethod = "Percent",
+			Callback = function(v)
+				local n = tonumber(v)
+				if n == nil or n ~= n then
+					return
+				end
+				-- The slider speaks percent (60-140) because DisplayMethod Percent
+				-- prints the raw number with a sign. Divided here, not stored, so
+				-- CFG.ui_scale stays a multiplier.
+				CFG.ui_scale = math.clamp(n / 100, 0.6, 1.4)
+				apply_theme()
+			end,
+		})
+
+		ui_main:Slider({
+			Name = "Opacidade",
+			Default = CFG.ui_opacity,
+			Minimum = 10,
+			Maximum = 100,
+			DisplayMethod = "Percent",
+			Callback = function(v)
+				local n = tonumber(v)
+				if n == nil or n ~= n then
+					return
+				end
+				CFG.ui_opacity = math.clamp(math.floor(n + 0.5), 10, 100)
+				apply_theme()
+			end,
+		})
+
+		ui_main:Dropdown({
+			Name = "Tema",
+			Options = THEME_NAMES,
+			Default = option_index_by_name(THEME_NAMES, CFG.ui_theme),
+			Callback = function(v)
+				local name = THEME_NAMES[tonumber(v) or 0]
+				if name ~= nil then
+					CFG.ui_theme = name
+					apply_theme()
+				end
+			end,
+		})
+
+		ui_colors:Header({ Text = "Bordas" })
+
+		ui_colors:Toggle({
+			Name = "RGB nas bordas",
+			Default = CFG.ui_rgb,
+			Callback = function(v)
+				CFG.ui_rgb = v and true or false
+				apply_theme()
+			end,
+		})
+
+		ui_colors:Slider({
+			Name = "Velocidade RGB",
+			Default = math.floor(CFG.ui_rgb_speed * 100 + 0.5),
+			Minimum = 5,
+			Maximum = 200,
+			DisplayMethod = "Percent",
+			Callback = function(v)
+				local n = tonumber(v)
+				if n == nil or n ~= n then
+					return
+				end
+				CFG.ui_rgb_speed = math.clamp(n / 100, 0.05, 2)
+			end,
+		})
+
+		-- ============================================================ DRONE
+		local DroneTab = Group:Tab({ Name = "DRONE" })
+		local drone_main = DroneTab:Section({ Side = "Left" })
+		local drone_esp = DroneTab:Section({ Side = "Right" })
+
+		drone_main:Header({ Text = "Drone" })
+
+		drone_main:Toggle({
+			Name = "Melhorar visao",
+			Default = CFG.drone_vision,
+			Callback = function(v)
+				CFG.drone_vision = v and true or false
+				-- Same switch the WORLD tab uses, so the two can never disagree.
+				CFG.world_drone = CFG.drone_vision
+				apply_world()
+			end,
+		})
+
+		drone_esp:Header({ Text = "ESP do drone" })
+
+		drone_esp:Toggle({
+			Name = "Enabled",
+			Default = CFG.drone_esp,
+			Callback = function(v)
+				CFG.drone_esp = v and true or false
+			end,
+		})
+
+		drone_esp:Toggle({
+			Name = "Distancia",
+			Default = CFG.drone_esp_dist,
+			Callback = function(v)
+				CFG.drone_esp_dist = v and true or false
+			end,
+		})
+
+		drone_esp:Toggle({
+			Name = "Piloto",
+			Default = CFG.drone_esp_pilot,
+			Callback = function(v)
+				CFG.drone_esp_pilot = v and true or false
+			end,
+		})
+
+		drone_esp:Toggle({
+			Name = "Glowing",
+			Default = CFG.drone_esp_glow,
+			Callback = function(v)
+				CFG.drone_esp_glow = v and true or false
+			end,
+		})
+
+		drone_esp:Dropdown({
+			Name = "Alcance",
+			Options = { "500", "1000", "2000", "4000" },
+			Default = option_index(DRONE_RANGES, CFG.drone_esp_range),
+			Callback = function(v)
+				local n = tonumber(v)
+				if n == nil then
+					return
+				end
+				for _, allowed in ipairs(DRONE_RANGES) do
+					if n == allowed then
+						CFG.drone_esp_range = n
+						return
+					end
+				end
+			end,
+		})
 
 		-- The 3D dummy is a separate ScreenGui, so it does not depend on the
 		-- library's internals. It follows the AIM tab: shown on AIM, hidden
@@ -7692,11 +8749,12 @@ local function build_ui()
 				-- Record the first widget text unique to the AIM tab, so the
 				-- sections can be recognised later: Section returns only the
 				-- widget-makers, never the Frame, and all sections share one name.
-				-- The library parents itself into CoreGui, but falls back to
-				-- PlayerGui on places that refuse CoreGui - and the guarded parent
-				-- hunk makes that fallback real. Look in both, and only accept a
-				-- Content that is actually attached: an unparented one from a
-				-- destroyed window would answer for the wrong menu.
+				--
+				-- WHERE THE MENU ACTUALLY LIVES, measured in game: not CoreGui and
+				-- not PlayerGui. The vendored parent patch tries gethui() first and
+				-- that succeeds, so MacLib lands in the executor's hidden container.
+				-- Looking only in CoreGui/PlayerGui found nothing, PICKER.content
+				-- stayed nil, and the dummy never appeared. All three are checked.
 				local function find_content(root)
 					if root == nil then
 						return nil
@@ -7714,8 +8772,13 @@ local function build_ui()
 				end
 				PICKER.content = nil
 				pcall(function()
-					PICKER.content = find_content(game:GetService("CoreGui"))
+					PICKER.content = find_content(gethui and gethui())
 				end)
+				if PICKER.content == nil then
+					pcall(function()
+						PICKER.content = find_content(game:GetService("CoreGui"))
+					end)
+				end
 				if PICKER.content == nil then
 					pcall(function()
 						PICKER.content = find_content(game:GetService("Players")
@@ -7730,11 +8793,17 @@ local function build_ui()
 		-- painted. The library builds it as a descendant named "SliderValue" and
 		-- hands back no handle, so it is located by name under the window after
 		-- the menu exists. Wrapped: a renamed internal only costs the colour.
+		--
+		-- Searched from the menu root, not from CoreGui: in game the menu lives in
+		-- gethui(), and looking only in CoreGui found nothing, so the FOV value
+		-- never got its band colour.
 		pcall(function()
-			for _, d in ipairs(game:GetService("CoreGui"):GetDescendants()) do
+			local root = menu_root()
+			if root == nil then
+				return
+			end
+			for _, d in ipairs(root:GetDescendants()) do
 				if d.Name == "SliderValue" and d:IsA("TextBox") then
-					-- Only the one inside the AIM tab: the ESP has no slider, so any
-					-- SliderValue on screen right now belongs to the FOV row.
 					fov_value_box = d
 					break
 				end
@@ -7743,6 +8812,9 @@ local function build_ui()
 				aim_tint_fov(CFG.aim_fov)
 			end
 		end)
+
+		-- First paint of the theme, scale and opacity, once the tree exists.
+		pcall(apply_theme)
 	end)
 
 	if not ok_body then
@@ -7773,7 +8845,7 @@ end
 
 if MacLib ~= nil then
 	if ui ~= nil then
-		print("[LF] stage 10: menu built, tabs = ESP, AIM")
+		print("[LF] stage 10: menu built, tabs = ESP, AIM, WORLD, UI, DRONE")
 	else
 		print("[LF] stage 10: menu built without body")
 	end
@@ -7827,7 +8899,17 @@ local function destroy_all()
 		-- name the drawing fields explicitly: s.snap and s.lines are tables of
 		-- drawings, so a blind pairs() walk would call :Remove() on a table and
 		-- throw once per field per player during teardown.
-		local singles = { s.outline, s.box, s.name, s.tag, s.hp_bg, s.hp_fill, s.hp_edge, s.dist }
+		--
+		-- box_fill is appended conditionally for the same reason the comment below
+		-- gives for snap/lines: a nil inside the literal truncates ipairs and
+		-- silently skips every entry after it.
+		local singles = {
+			s.outline, s.box, s.name, s.tag,
+			s.hp_bg, s.hp_fill, s.hp_edge, s.dist,
+		}
+		if s.box_fill ~= nil then
+			singles[#singles + 1] = s.box_fill
+		end
 		for _, obj in ipairs(singles) do
 			pcall(function() obj:Remove() end)
 		end
@@ -7847,6 +8929,24 @@ local function destroy_all()
 	state = {}
 	alloc.snap = nil
 	alloc.lines = nil
+	alloc.box_fill = nil
+	-- drone drawings and their Highlights. The Highlights are Instances on the
+	-- drone Models, so they outlive this script unless they are destroyed here -
+	-- two reloads would otherwise stack two glows on every drone.
+	for model, s in pairs(drone_draw) do
+		for _, obj in ipairs({ s.box, s.outline, s.label, s.dist }) do
+			pcall(function() obj:Remove() end)
+		end
+		pcall(function()
+			local hl = model:FindFirstChild("LF_DroneGlow")
+			if hl ~= nil then
+				hl:Destroy()
+			end
+		end)
+	end
+	drone_draw = {}
+	MENU.root = nil
+	MENU.applied = false
 	-- staged core slots: players still waiting must not survive a reload, or
 	-- the next instance would build slots for a table it no longer owns
 	core_pending = {}
@@ -7975,6 +9075,16 @@ keep(UIS.InputChanged:Connect(function()
 	end
 end))
 
+do
+	local env = globals()
+	local sh = env and env.LF_SHARED
+	if type(sh) == "table" then
+		sh.apply_world = apply_world
+		sh.apply_theme = apply_theme
+		sh.rebuild_menu = nil
+	end
+end
+
 print("[LF] stage 11: input bound")
 
 --[[ frame ]]
@@ -7995,6 +9105,13 @@ local function on_frame()
 	pcall(function()
 		picker_show(aim_tab_showing())
 	end)
+
+	-- Recolour the menu while the border RGB is on. Only then: a full recolour
+	-- walk is a few hundred property writes, and there is no reason to pay it
+	-- when the accent is a fixed colour.
+	if CFG.ui_rgb then
+		pcall(apply_theme)
+	end
 
 	frames = frames + 1
 
@@ -8045,6 +9162,17 @@ local function on_frame()
 					log[#log + 1] = "draw error: " .. tostring(err)
 				end
 			end
+		end
+	end
+
+	-- Drones are drawn after the players and from their own slots, so a drone
+	-- that appears or despawns can never disturb a player's drawings.
+	local ok_drone, drone_err = pcall(draw_drones, c, my_pos)
+	if not ok_drone then
+		draw_errors = draw_errors + 1
+		if drone_err ~= last_error then
+			last_error = drone_err
+			warn("[LF] drone draw error: " .. tostring(drone_err))
 		end
 	end
 
