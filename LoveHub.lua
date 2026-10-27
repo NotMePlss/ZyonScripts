@@ -35,7 +35,7 @@ local CONFIG = {
     LoveFPSMax = 16,                        -- ...e em 100%
 
     Folder = "IntroFrames",                 -- pasta dentro do workspace do executor
-    BaseUrl = "https://raw.githubusercontent.com/SEU_USER/SEU_REPO/main/frames/",
+    BaseUrl = "https://raw.githubusercontent.com/NotMePlss/ZyonScripts/refs/heads/main/LoveHub.lua",
     NormalCount = 4,
     LoveCount = 42,
 
